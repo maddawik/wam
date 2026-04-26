@@ -1,9 +1,17 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 func main() {
-	fmt.Println(getGreeting())
+	if len(os.Args) < 2 {
+		fmt.Println("Need to supply a config")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Config file is: %s", os.Args[1])
 }
 
 func getGreeting() string {
