@@ -1,0 +1,22 @@
+[tools]
+go = "1.27.4"
+golangci-lint = "2.15.0"
+goreleaser = "2.20.0"
+
+[env]
+# Non-secret environment variables
+CGO_ENABLED = "0"
+# Secrets (GITHUB_TOKEN) come from a gitignored .env; see .env.example
+_.file = { path = ".env", redact = true }
+
+[tasks.test]
+description = "Run tests"
+run = "go test ./..."
+
+[tasks.lint]
+description = "Run golangci-lint"
+run = "mise exec golangci-lint go -- golangci-lint run ./..."
+
+[tasks.build]
+description = "Build the wam binary"
+run = "go build -o dist/wam ./..."
