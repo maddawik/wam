@@ -22,42 +22,33 @@ const (
 	Terminated              // 143: SIGTERM
 )
 
-// ExitCode is the process exit code for k.
+var kinds = map[Kind]struct {
+	exit int
+	code string
+}{
+	Runtime:     {1, "runtime"},
+	Usage:       {2, "usage"},
+	Auth:        {3, "auth"},
+	NotFound:    {4, "not_found"},
+	Conflict:    {5, "conflict"},
+	Interrupted: {130, "interrupted"},
+	Terminated:  {143, "interrupted"},
+}
+
+// ExitCode is the process exit code for k. Unknown kinds are runtime errors.
 func (k Kind) ExitCode() int {
-	switch k {
-	case Usage:
-		return 2
-	case Auth:
-		return 3
-	case NotFound:
-		return 4
-	case Conflict:
-		return 5
-	case Interrupted:
-		return 130
-	case Terminated:
-		return 143
-	default:
-		return 1
+	if d, ok := kinds[k]; ok {
+		return d.exit
 	}
+	return 1
 }
 
 // String is the default machine-readable code for k.
 func (k Kind) String() string {
-	switch k {
-	case Usage:
-		return "usage"
-	case Auth:
-		return "auth"
-	case NotFound:
-		return "not_found"
-	case Conflict:
-		return "conflict"
-	case Interrupted, Terminated:
-		return "interrupted"
-	default:
-		return "runtime"
+	if d, ok := kinds[k]; ok {
+		return d.code
 	}
+	return "runtime"
 }
 
 // Error is a typed wam error.

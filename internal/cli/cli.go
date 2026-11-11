@@ -4,7 +4,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"runtime"
@@ -12,12 +11,6 @@ import (
 	"github.com/maddawik/wam/internal/errs"
 	"github.com/spf13/cobra"
 )
-
-func init() {
-	// Run every ancestor's persistent hooks, so the root's hook that marks
-	// "arguments parsed" can't be shadowed by a subcommand's.
-	cobra.EnableTraverseRunHooks = true
-}
 
 // Env is everything the command tree may touch outside its own arguments.
 // The real process environment is never read from inside this package.
@@ -50,17 +43,39 @@ func Execute(ctx context.Context, args []string, e Env, version string, extra ..
 		}
 	}()
 
-	root := newRoot(s, inv, version)
+	root := newRoot(inv)
 	root.AddCommand(extra...)
+	markParsed(root, inv)
 	root.SetArgs(args)
 	cmd, err := root.ExecuteContextC(s.with(ctx))
+	// A signal outranks whatever the command made of it.
+	if sig, ok := errs.As(context.Cause(ctx)); ok {
+		err = sig
+	}
 	if err == nil {
 		return 0
 	}
-	if cause := context.Cause(ctx); cause != nil && errors.Is(err, context.Canceled) {
-		err = cause
-	}
 	return inv.fail(cmd, err)
+}
+
+// markParsed wraps every command's run so inv.parsed is set once cobra has
+// accepted flags, arguments, required flags and flag groups.
+func markParsed(c *cobra.Command, inv *invocation) {
+	if run := c.Run; run != nil {
+		c.Run = func(cmd *cobra.Command, args []string) {
+			inv.parsed = true
+			run(cmd, args)
+		}
+	}
+	if run := c.RunE; run != nil {
+		c.RunE = func(cmd *cobra.Command, args []string) error {
+			inv.parsed = true
+			return run(cmd, args)
+		}
+	}
+	for _, sub := range c.Commands() {
+		markParsed(sub, inv)
+	}
 }
 
 // invocation is one run of the tree: what reporting errors and crashes needs.
@@ -73,7 +88,8 @@ type invocation struct {
 	parsed bool
 }
 
-func newRoot(s *IO, inv *invocation, version string) *cobra.Command {
+func newRoot(inv *invocation) *cobra.Command {
+	s := inv.io
 	root := &cobra.Command{
 		Use:           "wam",
 		Short:         "wam command-line tool",
@@ -84,17 +100,13 @@ func newRoot(s *IO, inv *invocation, version string) *cobra.Command {
 		// Cobra only applies this default on its own unknown-command path,
 		// which unknownCommand replaces.
 		SuggestionsMinimumDistance: 2,
-		PersistentPreRunE: func(*cobra.Command, []string) error {
-			inv.parsed = true
-			return nil
-		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return cmd.Help()
 		},
 	}
 	s.bindFlags(root)
 	installHelp(root, s)
-	root.AddCommand(newSync(), newVersion(version))
+	root.AddCommand(newSync(), newVersion(inv.version))
 	addCompletion(root)
 	root.SetIn(s.In)
 	root.SetOut(s.Out)

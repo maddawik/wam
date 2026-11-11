@@ -90,6 +90,27 @@ func TestCancelledContextReportsSignalExitCode(t *testing.T) {
 	}
 }
 
+func TestInterruptReportedEvenIfCommandIgnoresContext(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(errs.Interrupt(syscall.SIGINT))
+	for _, err := range []error{nil, errors.New("half done")} {
+		r := clitest.Run(t, clitest.Opts{Args: []string{"fail"}, Context: ctx, Commands: []*cobra.Command{failing(err)}})
+		if r.ExitCode != 130 {
+			t.Errorf("%v: exit = %d, want 130", err, r.ExitCode)
+		}
+	}
+}
+
+func TestRequiredFlagMissingIsUsageError(t *testing.T) {
+	c := &cobra.Command{Use: "need", RunE: func(*cobra.Command, []string) error { return nil }}
+	c.Flags().String("flavor", "", "")
+	_ = c.MarkFlagRequired("flavor")
+	r := clitest.Run(t, clitest.Opts{Args: []string{"need"}, Commands: []*cobra.Command{c}})
+	if r.ExitCode != 2 || !strings.Contains(r.Stderr, "flavor") {
+		t.Errorf("exit=%d stderr=%q", r.ExitCode, r.Stderr)
+	}
+}
+
 type envelope struct {
 	Error struct {
 		Code      string `json:"code"`
