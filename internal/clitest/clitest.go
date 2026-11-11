@@ -3,10 +3,12 @@ package clitest
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/maddawik/wam/internal/cli"
+	"github.com/spf13/cobra"
 )
 
 // Opts configures a single in-process run. Nothing is read from the real
@@ -19,6 +21,12 @@ type Opts struct {
 	StdoutTTY bool
 	StderrTTY bool
 	Version   string
+	// Context defaults to context.Background(). Cancel it with an
+	// errs.Interrupt cause to simulate a signal.
+	Context context.Context
+	// Commands are added to the root, to inject behaviour no real command
+	// has yet (a given error, a panic, a prompt).
+	Commands []*cobra.Command
 }
 
 // Result is what a run produced.
@@ -42,7 +50,11 @@ func Run(t *testing.T, o Opts) Result {
 	if version == "" {
 		version = "test"
 	}
-	code := cli.Execute(o.Args, cli.Env{
+	ctx := o.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	code := cli.Execute(ctx, o.Args, cli.Env{
 		Stdin:     strings.NewReader(o.Stdin),
 		Stdout:    &stdout,
 		Stderr:    &stderr,
@@ -50,6 +62,6 @@ func Run(t *testing.T, o Opts) Result {
 		StdoutTTY: o.StdoutTTY,
 		StderrTTY: o.StderrTTY,
 		Vars:      env,
-	}, version)
+	}, version, o.Commands...)
 	return Result{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: code, TempDir: t.TempDir()}
 }
