@@ -39,6 +39,7 @@ func newRoot(e Env, version string) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "wam",
 		Short:         "wam command-line tool",
+		Example:       "  wam version\n  wam sync\n  wam completion zsh",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {

@@ -48,7 +48,7 @@ func TestCompletionEmitsScriptForEachShell(t *testing.T) {
 
 func TestHelpWorksAtEveryDepthAndShowsExamples(t *testing.T) {
 	for _, args := range [][]string{
-		{"help", "sync"}, {"sync", "-h"}, {"sync", "--help"},
+		{"--help"}, {"-h"}, {"help", "sync"}, {"sync", "-h"}, {"sync", "--help"},
 		{"help", "version"}, {"version", "--help"},
 		{"help", "completion"}, {"completion", "zsh", "--help"},
 	} {
