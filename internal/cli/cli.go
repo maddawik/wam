@@ -1,11 +1,14 @@
-// Package cli defines the wam command tree.
+// Package cli defines the wam command tree and the output and error contract
+// every command shares.
 package cli
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io"
+	"runtime"
 
+	"github.com/maddawik/wam/internal/errs"
 	"github.com/spf13/cobra"
 )
 
@@ -25,33 +28,104 @@ type Env struct {
 }
 
 // Execute runs the wam command tree and returns the process exit code.
-func Execute(args []string, e Env, version string) int {
-	root := newRoot(e, version)
-	root.SetArgs(args)
-	if err := root.Execute(); err != nil {
-		_, _ = fmt.Fprintln(e.Stderr, "Error:", err)
-		return 2
+// Cancelling ctx with an *errs.Error cause (see errs.Interrupt) makes that
+// cause the reported error. extra commands are added to the root; tests use
+// them to inject behaviour.
+func Execute(ctx context.Context, args []string, e Env, version string, extra ...*cobra.Command) (code int) {
+	if e.Vars == nil {
+		e.Vars = map[string]string{}
 	}
-	return 0
+	s := &IO{In: e.Stdin, Out: e.Stdout, Err: e.Stderr, env: e}
+	inv := &invocation{io: s, version: version, args: args}
+	defer func() {
+		if r := recover(); r != nil {
+			code = inv.crash(r)
+		}
+	}()
+
+	root := newRoot(inv)
+	root.AddCommand(extra...)
+	markParsed(root, inv)
+	root.SetArgs(args)
+	cmd, err := root.ExecuteContextC(s.with(ctx))
+	// A signal outranks whatever the command made of it.
+	if sig, ok := errs.As(context.Cause(ctx)); ok {
+		err = sig
+	}
+	if err == nil {
+		return 0
+	}
+	return inv.fail(cmd, err)
 }
 
-func newRoot(e Env, version string) *cobra.Command {
+// markParsed wraps every command's run so inv.parsed is set once cobra has
+// accepted flags, arguments, required flags and flag groups.
+func markParsed(c *cobra.Command, inv *invocation) {
+	if run := c.Run; run != nil {
+		c.Run = func(cmd *cobra.Command, args []string) {
+			inv.parsed = true
+			run(cmd, args)
+		}
+	}
+	if run := c.RunE; run != nil {
+		c.RunE = func(cmd *cobra.Command, args []string) error {
+			inv.parsed = true
+			return run(cmd, args)
+		}
+	}
+	for _, sub := range c.Commands() {
+		markParsed(sub, inv)
+	}
+}
+
+// invocation is one run of the tree: what reporting errors and crashes needs.
+type invocation struct {
+	io      *IO
+	version string
+	args    []string
+	// parsed is set once flags and arguments have been accepted. An untyped
+	// error before that point is a usage error.
+	parsed bool
+}
+
+func newRoot(inv *invocation) *cobra.Command {
+	s := inv.io
 	root := &cobra.Command{
 		Use:           "wam",
 		Short:         "wam command-line tool",
 		Example:       "  wam version\n  wam sync\n  wam completion zsh",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          unknownCommand,
+		// Cobra only applies this default on its own unknown-command path,
+		// which unknownCommand replaces.
+		SuggestionsMinimumDistance: 2,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return cmd.Help()
 		},
 	}
-	root.AddCommand(newSync(), newVersion(version))
+	s.bindFlags(root)
+	installHelp(root, s)
+	root.AddCommand(newSync(), newVersion(inv.version))
 	addCompletion(root)
-	root.SetIn(e.Stdin)
-	root.SetOut(e.Stdout)
-	root.SetErr(e.Stderr)
+	root.SetIn(s.In)
+	root.SetOut(s.Out)
+	root.SetErr(s.Err)
 	return root
+}
+
+// unknownCommand rejects stray arguments to the root with a suggestion.
+func unknownCommand(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	msg := fmt.Sprintf("unknown command %q", args[0])
+	run := "wam --help"
+	if s := cmd.SuggestionsFor(args[0]); len(s) > 0 {
+		msg += fmt.Sprintf(". Did you mean %s?", s[0])
+		run = "wam " + s[0]
+	}
+	return errs.New(errs.Usage, msg, run)
 }
 
 // newSync is a placeholder until the real sync command lands.
@@ -60,20 +134,31 @@ func newSync() *cobra.Command {
 		Use:     "sync",
 		Short:   "Sync (not implemented yet)",
 		Example: "  wam sync\n  wam sync --help",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return errors.New("sync is not implemented yet")
+		RunE: func(*cobra.Command, []string) error {
+			return errs.New(errs.Runtime, "sync is not implemented yet", "wam --help")
 		},
 	}
+}
+
+type versionInfo struct {
+	Version string `json:"version"`
+	OS      string `json:"os"`
+	Arch    string `json:"arch"`
+	Go      string `json:"go"`
 }
 
 func newVersion(version string) *cobra.Command {
 	return &cobra.Command{
 		Use:     "version",
 		Short:   "Print the wam version",
-		Example: "  wam version",
+		Example: "  wam version\n  wam version --json",
 		Args:    cobra.NoArgs,
-		Run: func(cmd *cobra.Command, _ []string) {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), version)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			v := versionInfo{Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH, Go: runtime.Version()}
+			return From(cmd).Emit(v, func(w io.Writer) error {
+				_, err := fmt.Fprintln(w, v.Version)
+				return err
+			})
 		},
 	}
 }
