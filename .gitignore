@@ -1,0 +1,4 @@
+.env
+dist/
+AGENTS.md
+CLAUDE.md
