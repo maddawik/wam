@@ -19,4 +19,4 @@ run = "mise exec golangci-lint go -- golangci-lint run ./..."
 
 [tasks.build]
 description = "Build the wam binary"
-run = "go build -o dist/wam ./..."
+run = '''go build -ldflags "-X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o dist/wam .'''
