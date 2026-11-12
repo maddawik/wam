@@ -19,8 +19,11 @@ import (
 // renames each top-level folder into addonsDir. It returns the folders, in
 // the zip's casing. It never overwrites an existing folder except those named
 // in owned, which an earlier install put there; those are swapped for the new
-// ones, and put back if the swap fails.
-func Zip(zipPath, addonsDir string, owned []string) (folders []string, err error) {
+// ones, and put back if the swap fails. ownerOf names the other addon that
+// owns a folder, or returns ok false; a zip folder another addon owns, or one
+// already in addonsDir that nothing owns, is a conflict. Folder names are
+// compared case-insensitively.
+func Zip(zipPath, addonsDir string, owned []string, ownerOf func(folder string) (key string, ok bool)) (folders []string, err error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return nil, errs.Wrap(errs.Runtime, err, "downloaded file is not a valid zip", "")
@@ -40,14 +43,8 @@ func Zip(zipPath, addonsDir string, owned []string) (folders []string, err error
 	if err != nil {
 		return nil, err
 	}
-	own := map[string]bool{}
-	for _, f := range owned {
-		own[f] = true
-	}
-	for _, f := range folders {
-		if _, err := os.Lstat(filepath.Join(addonsDir, f)); err == nil && !own[f] {
-			return nil, errs.New(errs.Conflict, fmt.Sprintf("folder %s already exists in %s and wam does not own it", f, addonsDir), "")
-		}
+	if err := checkOwnership(folders, addonsDir, owned, ownerOf); err != nil {
+		return nil, err
 	}
 
 	// Move owned folders aside, place the new ones, and undo on failure.
@@ -87,6 +84,36 @@ func Zip(zipPath, addonsDir string, owned []string) (folders []string, err error
 		placed = append(placed, f)
 	}
 	return folders, nil
+}
+
+// checkOwnership refuses folders that another addon owns, or that are already
+// in addonsDir unmanaged.
+func checkOwnership(folders []string, addonsDir string, owned []string, ownerOf func(string) (string, bool)) error {
+	own := map[string]bool{}
+	for _, f := range owned {
+		own[strings.ToLower(f)] = true
+	}
+	present := map[string]bool{}
+	entries, err := os.ReadDir(addonsDir)
+	if err != nil {
+		return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot read %s", addonsDir), "")
+	}
+	for _, e := range entries {
+		present[strings.ToLower(e.Name())] = true
+	}
+	for _, f := range folders {
+		lf := strings.ToLower(f)
+		if own[lf] {
+			continue
+		}
+		if key, ok := ownerOf(f); ok {
+			return errs.New(errs.Conflict, fmt.Sprintf("folder %s is owned by %s", f, key), "")
+		}
+		if present[lf] {
+			return errs.New(errs.Conflict, fmt.Sprintf("folder %s is already in %s and is unmanaged", f, addonsDir), "")
+		}
+	}
+	return nil
 }
 
 // extract unpacks zr into dir and returns its top-level folders.

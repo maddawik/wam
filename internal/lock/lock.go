@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
+	"slices"
+	"strings"
 
 	toml "github.com/pelletier/go-toml/v2"
 
@@ -32,6 +35,24 @@ type Entry struct {
 	SHA256  string `toml:"sha256"`
 	// Folders are the top-level folders the addon owns, in the zip's casing.
 	Folders []string `toml:"folders"`
+}
+
+// Owner returns the key of the addon, other than except, that owns folder.
+// Folder names are compared case-insensitively. ok is false when no other
+// addon owns it.
+func (l *Lock) Owner(folder, except string) (key string, ok bool) {
+	keys := slices.Sorted(maps.Keys(l.Addons))
+	for _, k := range keys {
+		if k == except {
+			continue
+		}
+		for _, f := range l.Addons[k].Folders {
+			if strings.EqualFold(f, folder) {
+				return k, true
+			}
+		}
+	}
+	return "", false
 }
 
 // Load reads the lock at path. A missing file is an empty lock.
