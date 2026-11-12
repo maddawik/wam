@@ -9,4 +9,7 @@ require (
 	golang.org/x/term v0.48.0
 )
 
-require github.com/inconshreveable/mousetrap v1.1.0 // indirect
+require (
+	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/pelletier/go-toml/v2 v2.4.3 // indirect
+)

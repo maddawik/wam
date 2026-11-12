@@ -105,6 +105,7 @@ func newRoot(inv *invocation) *cobra.Command {
 		},
 	}
 	s.bindFlags(root)
+	bindPathFlags(root)
 	installHelp(root, s)
 	root.AddCommand(newSync(), newVersion(inv.version))
 	addCompletion(root)
@@ -126,18 +127,6 @@ func unknownCommand(cmd *cobra.Command, args []string) error {
 		run = "wam " + s[0]
 	}
 	return errs.New(errs.Usage, msg, run)
-}
-
-// newSync is a placeholder until the real sync command lands.
-func newSync() *cobra.Command {
-	return &cobra.Command{
-		Use:     "sync",
-		Short:   "Sync (not implemented yet)",
-		Example: "  wam sync\n  wam sync --help",
-		RunE: func(*cobra.Command, []string) error {
-			return errs.New(errs.Runtime, "sync is not implemented yet", "wam --help")
-		},
-	}
 }
 
 type versionInfo struct {
