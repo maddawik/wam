@@ -51,11 +51,14 @@ func Zip(zipPath, addonsDir string, owned []string) (folders []string, err error
 	}
 
 	// Move owned folders aside, place the new ones, and undo on failure.
-	aside, err := os.MkdirTemp(filepath.Dir(addonsDir), ".wam-old-")
-	if err != nil {
-		return nil, errs.Wrap(errs.Runtime, err, "cannot create a temp folder beside the AddOns folder", "")
+	var aside string
+	if len(owned) > 0 {
+		aside, err = os.MkdirTemp(filepath.Dir(addonsDir), ".wam-old-")
+		if err != nil {
+			return nil, errs.Wrap(errs.Runtime, err, "cannot create a temp folder beside the AddOns folder", "")
+		}
+		defer func() { _ = os.RemoveAll(aside) }()
 	}
-	defer func() { _ = os.RemoveAll(aside) }()
 	var moved, placed []string
 	rollback := func() {
 		for _, p := range placed {

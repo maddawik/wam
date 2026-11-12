@@ -7,6 +7,9 @@ import (
 	"io"
 )
 
+// Latest is the version that means "the newest stable release".
+const Latest = "latest"
+
 // Release is one resolved release of an addon.
 type Release struct {
 	Tag   string

@@ -23,7 +23,7 @@ type Lock struct {
 type Entry struct {
 	Source string `toml:"source"`
 	// Version is the manifest version this entry was resolved for. Empty
-	// means "latest".
+	// means source.Latest.
 	Version string `toml:"version"`
 	Repo    string `toml:"repo"`
 	Tag     string `toml:"tag"`

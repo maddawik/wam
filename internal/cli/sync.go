@@ -106,36 +106,51 @@ func runSync(ctx context.Context, src source.Source, manifestPath, addonsDir str
 		if a.Source != "github" {
 			return changes, errs.New(errs.Usage, fmt.Sprintf("source %q is not supported; only github", a.Source), "wam sync --help")
 		}
-		locked, isLocked := l.Addons[a.Key]
-		if isLocked && locked.Version == "" {
-			locked.Version = "latest" // locks written before pins existed
+		var locked *lock.Entry
+		if e, ok := l.Addons[a.Key]; ok {
+			locked = &e
 		}
-		var entry lock.Entry
-		switch {
-		case isLocked && locked.Version == a.Version:
-			// Install exactly what the lock records, if it isn't there yet.
-			if installed(addonsDir, locked.Folders) {
-				continue
-			}
-			if err := restoreAddon(ctx, src, a.Key, locked, addonsDir); err != nil {
-				return changes, err
-			}
-			entry = locked
-		default:
-			// New to the lock, or its pin changed: resolve it again.
-			var replace []string
-			if isLocked {
-				replace = locked.Folders
-			}
-			entry, err = installAddon(ctx, src, a, addonsDir, replace)
-			if err != nil {
-				return changes, err
-			}
+		entry, changed, err := syncAddon(ctx, src, a, locked, addonsDir)
+		if err != nil {
+			return changes, err
+		}
+		if !changed {
+			continue
 		}
 		l.Addons[a.Key] = entry
 		changes = append(changes, syncChange{Addon: a.Key, Tag: entry.Tag, Folders: entry.Folders})
 	}
 	return changes, nil
+}
+
+// syncAddon brings one addon in line with the manifest. locked is its lock
+// entry, or nil. changed is false when there was nothing to do.
+func syncAddon(ctx context.Context, src source.Source, a manifest.Addon, locked *lock.Entry, addonsDir string) (entry lock.Entry, changed bool, err error) {
+	if locked == nil || lockedVersion(*locked) != a.Version {
+		// New to the lock, or its pin changed: resolve it again, replacing
+		// the folders the old version put there.
+		var owned []string
+		if locked != nil {
+			owned = locked.Folders
+		}
+		entry, err = installAddon(ctx, src, a, addonsDir, owned)
+		return entry, err == nil, err
+	}
+	// Install exactly what the lock records, if it isn't there yet.
+	if installed(addonsDir, locked.Folders) {
+		return *locked, false, nil
+	}
+	err = restoreAddon(ctx, src, a.Key, *locked, addonsDir)
+	return *locked, err == nil, err
+}
+
+// lockedVersion is the manifest version e was resolved for. Locks written
+// before pins existed have none and were always latest.
+func lockedVersion(e lock.Entry) string {
+	if e.Version == "" {
+		return source.Latest
+	}
+	return e.Version
 }
 
 // installed reports whether every one of folders is in addonsDir.
@@ -154,17 +169,33 @@ func installed(addonsDir string, folders []string) bool {
 // restoreAddon installs the release the lock records, without asking the host
 // what is newest. The download must match the lock's hash.
 func restoreAddon(ctx context.Context, src source.Source, key string, e lock.Entry, addonsDir string) error {
-	rel := source.Release{Tag: e.Tag, Asset: e.Asset, URL: e.URL}
-	_, _, err := downloadAndInstall(ctx, src, rel, addonsDir, nil, &verify{key: key, sha256: e.SHA256})
+	zipPath, sum, cleanup, err := fetch(ctx, src, e.URL)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if sum != e.SHA256 {
+		return errs.New(errs.Conflict,
+			fmt.Sprintf("%s %s does not match the lock's SHA-256; the asset changed since it was locked", key, e.Tag),
+			"wam update "+key)
+	}
+	_, err = install.Zip(zipPath, addonsDir, nil)
 	return err
 }
 
-func installAddon(ctx context.Context, src source.Source, a manifest.Addon, addonsDir string, replace []string) (lock.Entry, error) {
+// installAddon resolves a, installs it over any owned folders, and returns
+// its lock entry.
+func installAddon(ctx context.Context, src source.Source, a manifest.Addon, addonsDir string, owned []string) (lock.Entry, error) {
 	rel, err := src.Resolve(ctx, a.ID, a.Version)
 	if err != nil {
 		return lock.Entry{}, err
 	}
-	sum, folders, err := downloadAndInstall(ctx, src, rel, addonsDir, replace, nil)
+	zipPath, sum, cleanup, err := fetch(ctx, src, rel.URL)
+	if err != nil {
+		return lock.Entry{}, err
+	}
+	defer cleanup()
+	folders, err := install.Zip(zipPath, addonsDir, owned)
 	if err != nil {
 		return lock.Entry{}, err
 	}
@@ -174,39 +205,22 @@ func installAddon(ctx context.Context, src source.Source, a manifest.Addon, addo
 	}, nil
 }
 
-// verify is the hash a download must match.
-type verify struct {
-	key    string // manifest key, for the fix command
-	sha256 string
-}
-
-// downloadAndInstall fetches rel's zip to a temp file, hashing it on the way,
-// and installs it. With want set, it refuses a zip that doesn't match.
-func downloadAndInstall(ctx context.Context, src source.Source, rel source.Release, addonsDir string, replace []string, want *verify) (sum string, folders []string, err error) {
+// fetch downloads url to a temp file, hashing it on the way. Call cleanup to
+// delete the file.
+func fetch(ctx context.Context, src source.Source, url string) (path, sum string, cleanup func(), err error) {
 	tmp, err := os.CreateTemp("", "wam-*.zip")
 	if err != nil {
-		return "", nil, errs.Wrap(errs.Runtime, err, "cannot create a temp file", "")
+		return "", "", nil, errs.Wrap(errs.Runtime, err, "cannot create a temp file", "")
 	}
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
-	}()
+	cleanup = func() { _ = os.Remove(tmp.Name()) }
 	h := sha256.New()
-	if err := src.Download(ctx, rel.URL, io.MultiWriter(tmp, h)); err != nil {
-		return "", nil, err
+	err = src.Download(ctx, url, io.MultiWriter(tmp, h))
+	if cerr := tmp.Close(); err == nil && cerr != nil {
+		err = errs.Wrap(errs.Runtime, cerr, "cannot write the download", "")
 	}
-	if err := tmp.Close(); err != nil {
-		return "", nil, errs.Wrap(errs.Runtime, err, "cannot write the download", "")
-	}
-	sum = hex.EncodeToString(h.Sum(nil))
-	if want != nil && sum != want.sha256 {
-		return "", nil, errs.New(errs.Conflict,
-			fmt.Sprintf("%s %s does not match the lock's SHA-256; the asset changed since it was locked", want.key, rel.Tag),
-			"wam update "+want.key)
-	}
-	folders, err = install.Zip(tmp.Name(), addonsDir, replace)
 	if err != nil {
-		return "", nil, err
+		cleanup()
+		return "", "", nil, err
 	}
-	return sum, folders, nil
+	return tmp.Name(), hex.EncodeToString(h.Sum(nil)), cleanup, nil
 }
