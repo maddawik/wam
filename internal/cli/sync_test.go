@@ -3,6 +3,7 @@ package cli_test
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,9 +16,11 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/maddawik/wam/internal/clitest"
+	"github.com/maddawik/wam/internal/errs"
 	"github.com/maddawik/wam/internal/lock"
 )
 
@@ -37,6 +40,8 @@ type fakeServer struct {
 	mu       sync.Mutex
 	repos    map[string][]fakeRelease
 	releases map[string]int // requests to the releases endpoints, by repo
+	// onDownload, if set, runs before an asset is served.
+	onDownload func(*http.Request)
 }
 
 func fakeGitHub(t *testing.T, repos map[string][]fakeRelease) *fakeServer {
@@ -76,6 +81,9 @@ func (f *fakeServer) json(w http.ResponseWriter, repo string, r fakeRelease) map
 }
 
 func (f *fakeServer) serve(w http.ResponseWriter, req *http.Request) {
+	if f.onDownload != nil && strings.HasPrefix(req.URL.Path, "/download/") {
+		f.onDownload(req)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	path := req.URL.Path
@@ -358,8 +366,11 @@ func TestSyncRejectsZipEntriesThatEscapeTheAddOnsFolder(t *testing.T) {
 	if r.ExitCode != 5 {
 		t.Errorf("exit = %d, want 5; stderr = %q", r.ExitCode, r.Stderr)
 	}
-	if _, err := os.Stat(filepath.Join(filepath.Dir(e.addons), "evil.lua")); err == nil {
-		t.Error("zip entry escaped the AddOns folder")
+	// Nothing is written outside the AddOns folder, nor left inside it.
+	for dir, want := range map[string]int{filepath.Dir(e.addons): 1, e.addons: 0} {
+		if got, err := os.ReadDir(dir); err != nil || len(got) != want {
+			t.Errorf("%s holds %v (err %v), want %d entries", dir, got, err, want)
+		}
 	}
 }
 
@@ -734,4 +745,129 @@ func TestSyncSummarisesEveryFailureAndExitsOne(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.addons, "Beta", "b.lua")); err != nil {
 		t.Errorf("beta not installed: %v", err)
 	}
+}
+
+// assertNoTempFiles fails if dir holds anything wam uses only while working.
+func assertNoTempFiles(t *testing.T, dir string) {
+	t.Helper()
+	es, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range es {
+		if strings.HasPrefix(e.Name(), ".wam-") {
+			t.Errorf("%s left in %s", e.Name(), dir)
+		}
+	}
+}
+
+func TestSyncUpgradeReplacesTheAddonsFolders(t *testing.T) {
+	v1 := makeZip(t, map[string]string{"Alpha/a.lua": "v1", "Alpha/old.lua": "v1", "AlphaOld/x.lua": "v1"})
+	v2 := makeZip(t, map[string]string{"Alpha/a.lua": "v2", "AlphaNew/y.lua": "v2"})
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v2", Assets: map[string][]byte{"a.zip": v2}}, {Tag: "v1", Assets: map[string][]byte{"a.zip": v1}}},
+	})
+	e := newSyncEnv(t, gh, pinned("v1"))
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("v1: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	write(t, e.manifest, pinned("v2"))
+
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("v2: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(e.addons, "Alpha", "a.lua")); got != "v2" {
+		t.Errorf("a.lua = %q, want v2", got)
+	}
+	for _, p := range []string{"Alpha/old.lua", "AlphaOld"} {
+		if _, err := os.Stat(filepath.Join(e.addons, filepath.FromSlash(p))); err == nil {
+			t.Errorf("%s survived the upgrade", p)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(e.addons, "AlphaNew", "y.lua")); err != nil {
+		t.Errorf("AlphaNew not installed: %v", err)
+	}
+	assertNoTempFiles(t, e.addons)
+}
+
+func TestSyncInterruptedMidDownloadExits130AndLeavesNoTempFiles(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{"a.zip": alphaZip(t, "v1")}}},
+	})
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	gh.onDownload = func(req *http.Request) {
+		// The signal arrives while the asset is downloading.
+		cancel(errs.Interrupt(syscall.SIGINT))
+		<-req.Context().Done()
+	}
+	e := newSyncEnv(t, gh, oneAddon)
+
+	r := clitest.Run(t, clitest.Opts{Args: []string{"sync", "-f", e.manifest, "--dir", e.addons}, Env: e.vars, Context: ctx})
+	if r.ExitCode != 130 {
+		t.Errorf("exit = %d, want 130; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	assertNoTempFiles(t, e.addons)
+	if _, err := os.Stat(filepath.Join(e.addons, "Alpha")); err == nil {
+		t.Error("Alpha installed although the run was interrupted")
+	}
+}
+
+func TestSyncRestoresWhatACrashedRunLeftHalfSwapped(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{"a.zip": alphaZip(t, "v1")}}},
+	})
+	e := newSyncEnv(t, gh, oneAddon)
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	// A run killed after moving Alpha aside, before placing its replacement.
+	aside := filepath.Join(e.addons, ".wam-old-1", "d")
+	if err := os.MkdirAll(aside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(e.addons, "Alpha"), filepath.Join(aside, "Alpha")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(e.addons, ".wam-tmp-2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := e.sync(t)
+	if r.ExitCode != 0 || r.Stdout != "" {
+		t.Errorf("exit = %d, stdout = %q, stderr = %q; want the folder restored, not reinstalled", r.ExitCode, r.Stdout, r.Stderr)
+	}
+	if _, err := os.Stat(filepath.Join(e.addons, "Alpha", "Alpha.toc")); err != nil {
+		t.Errorf("Alpha not restored: %v", err)
+	}
+	assertNoTempFiles(t, e.addons)
+}
+
+func TestSyncInterruptedPartWayLocksWhatItInstalled(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{"a.zip": alphaZip(t, "v1")}}},
+		"acme/beta":  {{Tag: "v1", Assets: map[string][]byte{"b.zip": makeZip(t, map[string]string{"Beta/b.lua": "b"})}}},
+	})
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	gh.onDownload = func(req *http.Request) {
+		if strings.Contains(req.URL.Path, "acme/beta") {
+			cancel(errs.Interrupt(syscall.SIGTERM))
+			<-req.Context().Done()
+		}
+	}
+	e := newSyncEnv(t, gh, oneAddon+`"github:acme/beta" = "latest"`+"\n")
+
+	r := clitest.Run(t, clitest.Opts{Args: []string{"sync", "-f", e.manifest, "--dir", e.addons}, Env: e.vars, Context: ctx})
+	if r.ExitCode != 143 {
+		t.Errorf("exit = %d, want 143; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	l, err := lock.Load(e.lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := l.Addons["github:acme/alpha"]; !ok || len(l.Addons) != 1 {
+		t.Errorf("lock = %+v, want just alpha", l.Addons)
+	}
+	assertNoTempFiles(t, e.addons)
 }
