@@ -11,10 +11,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/maddawik/wam/internal/clitest"
+	"github.com/maddawik/wam/internal/lock"
 )
 
 type fakeRelease struct {
@@ -158,21 +161,22 @@ func TestSyncInstallsLatestReleaseAndWritesLock(t *testing.T) {
 		t.Errorf("a.x = %q", got)
 	}
 
-	lock := read(t, e.lock)
-	for _, want := range []string{
-		`github:acme/alpha`,
-		`source = 'github'`,
-		`repo = 'acme/alpha'`,
-		`tag = 'v2.0.0'`,
-		`asset = 'Alpha-v2.0.0.zip'`,
-		`url = '` + gh.URL + `/download/acme/alpha/v2.0.0/Alpha-v2.0.0.zip'`,
-		`sha256 = '` + sha(zipBytes) + `'`,
-		`'Alpha'`,
-		`'AlphaOptions'`,
-	} {
-		if !strings.Contains(lock, want) {
-			t.Errorf("lock lacks %s:\n%s", want, lock)
-		}
+	l, err := lock.Load(e.lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := l.Addons["github:acme/alpha"]
+	if !ok {
+		t.Fatalf("lock has no github:acme/alpha: %+v", l.Addons)
+	}
+	want := lock.Entry{
+		Source: "github", Repo: "acme/alpha", Tag: "v2.0.0", Asset: "Alpha-v2.0.0.zip",
+		URL:    gh.URL + "/download/acme/alpha/v2.0.0/Alpha-v2.0.0.zip",
+		SHA256: sha(zipBytes), Folders: []string{"Alpha", "AlphaOptions"},
+	}
+	slices.Sort(got.Folders)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("lock entry = %+v, want %+v", got, want)
 	}
 }
 

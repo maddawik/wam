@@ -53,7 +53,7 @@ func newSync() *cobra.Command {
 				return errs.New(errs.Usage, "no AddOns folder: pass --dir <path>", "wam sync -f wam.toml --dir <AddOns>")
 			}
 			gh := &source.GitHub{BaseURL: s.env.Vars["WAM_GITHUB_API"], Token: s.env.Vars["GITHUB_TOKEN"]}
-			changes, err := runSync(cmd.Context(), s, gh, file, dir)
+			changes, err := runSync(cmd.Context(), gh, file, dir)
 			// Report what was installed even when a later addon failed.
 			if len(changes) > 0 || err == nil {
 				if eerr := s.Emit(changes, func(w io.Writer) error {
@@ -79,7 +79,7 @@ func lockPath(manifestPath string) string {
 
 // runSync installs every manifest addon the lock doesn't have yet. It stops
 // at the first failure but still saves the lock for addons already installed.
-func runSync(ctx context.Context, s *IO, src source.Source, manifestPath, addonsDir string) (changes []syncChange, err error) {
+func runSync(ctx context.Context, src source.Source, manifestPath, addonsDir string) (changes []syncChange, err error) {
 	m, err := manifest.Load(manifestPath)
 	if err != nil {
 		return nil, err
@@ -112,7 +112,6 @@ func runSync(ctx context.Context, s *IO, src source.Source, manifestPath, addons
 		}
 		l.Addons[a.Key] = entry
 		changes = append(changes, syncChange{Addon: a.Key, Tag: entry.Tag, Folders: entry.Folders})
-		s.Infof("installed %s %s", a.Key, entry.Tag)
 	}
 	return changes, nil
 }
