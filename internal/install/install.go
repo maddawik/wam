@@ -17,8 +17,10 @@ import (
 
 // Zip extracts the zip at zipPath into a temp dir beside addonsDir, then
 // renames each top-level folder into addonsDir. It returns the folders, in
-// the zip's casing. It never overwrites an existing folder.
-func Zip(zipPath, addonsDir string) (folders []string, err error) {
+// the zip's casing. It never overwrites an existing folder except those named
+// in owned, which an earlier install put there; those are swapped for the new
+// ones, and put back if the swap fails.
+func Zip(zipPath, addonsDir string, owned []string) (folders []string, err error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return nil, errs.Wrap(errs.Runtime, err, "downloaded file is not a valid zip", "")
@@ -38,17 +40,45 @@ func Zip(zipPath, addonsDir string) (folders []string, err error) {
 	if err != nil {
 		return nil, err
 	}
+	own := map[string]bool{}
+	for _, f := range owned {
+		own[f] = true
+	}
 	for _, f := range folders {
-		if _, err := os.Lstat(filepath.Join(addonsDir, f)); err == nil {
+		if _, err := os.Lstat(filepath.Join(addonsDir, f)); err == nil && !own[f] {
 			return nil, errs.New(errs.Conflict, fmt.Sprintf("folder %s already exists in %s and wam does not own it", f, addonsDir), "")
 		}
 	}
-	var placed []string
+
+	// Move owned folders aside, place the new ones, and undo on failure.
+	aside, err := os.MkdirTemp(filepath.Dir(addonsDir), ".wam-old-")
+	if err != nil {
+		return nil, errs.Wrap(errs.Runtime, err, "cannot create a temp folder beside the AddOns folder", "")
+	}
+	defer func() { _ = os.RemoveAll(aside) }()
+	var moved, placed []string
+	rollback := func() {
+		for _, p := range placed {
+			_ = os.RemoveAll(filepath.Join(addonsDir, p))
+		}
+		for _, m := range moved {
+			_ = os.Rename(filepath.Join(aside, m), filepath.Join(addonsDir, m))
+		}
+	}
+	for _, f := range owned {
+		err := os.Rename(filepath.Join(addonsDir, f), filepath.Join(aside, f))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			rollback()
+			return nil, errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot replace %s in %s", f, addonsDir), "")
+		}
+		moved = append(moved, f)
+	}
 	for _, f := range folders {
 		if err := os.Rename(filepath.Join(tmp, f), filepath.Join(addonsDir, f)); err != nil {
-			for _, p := range placed {
-				_ = os.RemoveAll(filepath.Join(addonsDir, p))
-			}
+			rollback()
 			return nil, errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot place %s in %s", f, addonsDir), "")
 		}
 		placed = append(placed, f)

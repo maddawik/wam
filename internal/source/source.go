@@ -17,7 +17,7 @@ type Release struct {
 // Source is an addon host.
 type Source interface {
 	// Resolve finds the release of id that version names. version is "latest"
-	// or an exact tag.
+	// or an exact tag, matched as an opaque string.
 	Resolve(ctx context.Context, id, version string) (Release, error)
 	// Download writes the asset at url to w.
 	Download(ctx context.Context, url string, w io.Writer) error
