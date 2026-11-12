@@ -582,7 +582,11 @@ func TestSyncRefusesAFolderAnotherAddonOwnsIgnoringCase(t *testing.T) {
 		"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{"a.zip": makeZip(t, map[string]string{"Questie/a.lua": "alpha"})}}},
 		"acme/beta":  {{Tag: "v1", Assets: map[string][]byte{"b.zip": makeZip(t, map[string]string{"questie/b.lua": "beta"})}}},
 	})
-	e := newSyncEnv(t, gh, twoAddons(alphaLine, betaLine))
+	e := newSyncEnv(t, gh, twoAddons(alphaLine, ""))
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("first sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	write(t, e.manifest, twoAddons(alphaLine, betaLine))
 
 	r := e.sync(t)
 	if r.ExitCode != 5 {
@@ -684,8 +688,8 @@ func TestSyncKeepsGoingPastAFailingAddon(t *testing.T) {
 	e := newSyncEnv(t, gh, twoAddons(alphaLine, betaLine))
 
 	r := e.sync(t)
-	if r.ExitCode == 0 || !strings.Contains(r.Stderr, "github:acme/alpha") {
-		t.Errorf("exit = %d, stderr = %q; want non-zero naming alpha", r.ExitCode, r.Stderr)
+	if r.ExitCode != 1 || !strings.Contains(r.Stderr, "github:acme/alpha") {
+		t.Errorf("exit = %d, stderr = %q; want 1 naming alpha", r.ExitCode, r.Stderr)
 	}
 	if got := read(t, filepath.Join(e.addons, "Beta", "b.lua")); got != "b" {
 		t.Errorf("Beta = %q", got)
@@ -712,18 +716,18 @@ func TestSyncSummarisesEveryFailureAndExitsOne(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, json := range []bool{false, true} {
+	for _, asJSON := range []bool{false, true} {
 		var extra []string
-		if json {
+		if asJSON {
 			extra = []string{"--json"}
 		}
 		r := e.sync(t, extra...)
 		if r.ExitCode != 1 {
-			t.Errorf("json=%v: exit = %d, want 1; stderr = %q", json, r.ExitCode, r.Stderr)
+			t.Errorf("json=%v: exit = %d, want 1; stderr = %q", asJSON, r.ExitCode, r.Stderr)
 		}
 		for _, want := range []string{"github:acme/alpha", "github:acme/gamma", "Handmade"} {
 			if !strings.Contains(r.Stderr, want) {
-				t.Errorf("json=%v: stderr lacks %q: %q", json, want, r.Stderr)
+				t.Errorf("json=%v: stderr lacks %q: %q", asJSON, want, r.Stderr)
 			}
 		}
 	}

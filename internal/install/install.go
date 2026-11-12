@@ -15,6 +15,10 @@ import (
 	"github.com/maddawik/wam/internal/errs"
 )
 
+// OwnerFunc returns the key of the other addon that owns folder, compared
+// case-insensitively, or ok false when no other addon does.
+type OwnerFunc func(folder string) (key string, ok bool)
+
 // Zip extracts the zip at zipPath into a temp dir beside addonsDir, then
 // renames each top-level folder into addonsDir. It returns the folders, in
 // the zip's casing. It never overwrites an existing folder except those named
@@ -23,7 +27,7 @@ import (
 // owns a folder, or returns ok false; a zip folder another addon owns, or one
 // already in addonsDir that nothing owns, is a conflict. Folder names are
 // compared case-insensitively.
-func Zip(zipPath, addonsDir string, owned []string, ownerOf func(folder string) (key string, ok bool)) (folders []string, err error) {
+func Zip(zipPath, addonsDir string, owned []string, ownerOf OwnerFunc) (folders []string, err error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return nil, errs.Wrap(errs.Runtime, err, "downloaded file is not a valid zip", "")
@@ -88,7 +92,7 @@ func Zip(zipPath, addonsDir string, owned []string, ownerOf func(folder string) 
 
 // checkOwnership refuses folders that another addon owns, or that are already
 // in addonsDir unmanaged.
-func checkOwnership(folders []string, addonsDir string, owned []string, ownerOf func(string) (string, bool)) error {
+func checkOwnership(folders []string, addonsDir string, owned []string, ownerOf OwnerFunc) error {
 	own := map[string]bool{}
 	for _, f := range owned {
 		own[strings.ToLower(f)] = true
