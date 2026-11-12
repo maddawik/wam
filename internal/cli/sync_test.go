@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/maddawik/wam/internal/clitest"
@@ -28,40 +29,105 @@ type fakeRelease struct {
 	Assets map[string][]byte
 }
 
-// fakeGitHub serves the subset of the GitHub REST API wam uses, from repos
-// keyed "owner/repo", newest release first.
-func fakeGitHub(t *testing.T, repos map[string][]fakeRelease) *httptest.Server {
+// fakeServer serves the subset of the GitHub REST API wam uses, from repos
+// keyed "owner/repo", newest release first. Tests can change a repo between
+// syncs with set.
+type fakeServer struct {
+	*httptest.Server
+	mu       sync.Mutex
+	repos    map[string][]fakeRelease
+	releases map[string]int // requests to the releases endpoints, by repo
+}
+
+func fakeGitHub(t *testing.T, repos map[string][]fakeRelease) *fakeServer {
 	t.Helper()
-	mux := http.NewServeMux()
-	var srv *httptest.Server
-	for repo, releases := range repos {
-		mux.HandleFunc("/repos/"+repo+"/releases", func(w http.ResponseWriter, _ *http.Request) {
-			var out []map[string]any
-			for _, r := range releases {
-				var assets []map[string]any
-				for name := range r.Assets {
-					assets = append(assets, map[string]any{
-						"name":                 name,
-						"browser_download_url": fmt.Sprintf("%s/download/%s/%s/%s", srv.URL, repo, r.Tag, name),
-					})
-				}
-				out = append(out, map[string]any{
-					"tag_name": r.Tag, "draft": r.Draft, "prerelease": r.Prerelease, "assets": assets,
-				})
-			}
-			_ = json.NewEncoder(w).Encode(out)
+	f := &fakeServer{repos: repos, releases: map[string]int{}}
+	if f.repos == nil {
+		f.repos = map[string][]fakeRelease{}
+	}
+	f.Server = httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(f.Close)
+	return f
+}
+
+// set replaces a repo's releases.
+func (f *fakeServer) set(repo string, releases []fakeRelease) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repos[repo] = releases
+}
+
+// lookups is how many times wam asked about repo's releases.
+func (f *fakeServer) lookups(repo string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.releases[repo]
+}
+
+func (f *fakeServer) json(w http.ResponseWriter, repo string, r fakeRelease) map[string]any {
+	var assets []map[string]any
+	for name := range r.Assets {
+		assets = append(assets, map[string]any{
+			"name":                 name,
+			"browser_download_url": fmt.Sprintf("%s/download/%s/%s/%s", f.URL, repo, r.Tag, name),
 		})
-		for _, r := range releases {
-			for name, body := range r.Assets {
-				mux.HandleFunc(fmt.Sprintf("/download/%s/%s/%s", repo, r.Tag, name), func(w http.ResponseWriter, _ *http.Request) {
-					_, _ = w.Write(body)
-				})
+	}
+	return map[string]any{"tag_name": r.Tag, "draft": r.Draft, "prerelease": r.Prerelease, "assets": assets}
+}
+
+func (f *fakeServer) serve(w http.ResponseWriter, req *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	path := req.URL.Path
+	if rest, ok := strings.CutPrefix(path, "/download/"); ok {
+		parts := strings.Split(rest, "/")
+		if len(parts) >= 4 {
+			repo := parts[0] + "/" + parts[1]
+			tag := strings.Join(parts[2:len(parts)-1], "/")
+			name := parts[len(parts)-1]
+			for _, r := range f.repos[repo] {
+				if r.Tag == tag {
+					if body, ok := r.Assets[name]; ok {
+						_, _ = w.Write(body)
+						return
+					}
+				}
 			}
 		}
+		http.NotFound(w, req)
+		return
 	}
-	srv = httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv
+	rest, ok := strings.CutPrefix(path, "/repos/")
+	if !ok {
+		http.NotFound(w, req)
+		return
+	}
+	if repo, tag, ok := strings.Cut(rest, "/releases/tags/"); ok {
+		f.releases[repo]++
+		for _, r := range f.repos[repo] {
+			if r.Tag == tag {
+				_ = json.NewEncoder(w).Encode(f.json(w, repo, r))
+				return
+			}
+		}
+		http.NotFound(w, req)
+		return
+	}
+	if repo, ok := strings.CutSuffix(rest, "/releases"); ok {
+		releases, known := f.repos[repo]
+		if !known {
+			http.NotFound(w, req)
+			return
+		}
+		f.releases[repo]++
+		var out []map[string]any
+		for _, r := range releases {
+			out = append(out, f.json(w, repo, r))
+		}
+		_ = json.NewEncoder(w).Encode(out)
+		return
+	}
+	http.NotFound(w, req)
 }
 
 // makeZip builds a zip from path→content pairs. Paths ending in "/" are
@@ -112,7 +178,7 @@ type syncEnv struct {
 	vars                   map[string]string
 }
 
-func newSyncEnv(t *testing.T, gh *httptest.Server, manifest string) syncEnv {
+func newSyncEnv(t *testing.T, gh *fakeServer, manifest string) syncEnv {
 	t.Helper()
 	root := t.TempDir()
 	e := syncEnv{
@@ -170,7 +236,7 @@ func TestSyncInstallsLatestReleaseAndWritesLock(t *testing.T) {
 		t.Fatalf("lock has no github:acme/alpha: %+v", l.Addons)
 	}
 	want := lock.Entry{
-		Source: "github", Repo: "acme/alpha", Tag: "v2.0.0", Asset: "Alpha-v2.0.0.zip",
+		Source: "github", Repo: "acme/alpha", Version: "latest", Tag: "v2.0.0", Asset: "Alpha-v2.0.0.zip",
 		URL:    gh.URL + "/download/acme/alpha/v2.0.0/Alpha-v2.0.0.zip",
 		SHA256: sha(zipBytes), Folders: []string{"Alpha", "AlphaOptions"},
 	}
@@ -303,5 +369,201 @@ func TestSyncWithoutFileOrDirIsAUsageError(t *testing.T) {
 		if r.ExitCode != 2 {
 			t.Errorf("%v: exit = %d, want 2; stderr = %q", args, r.ExitCode, r.Stderr)
 		}
+	}
+}
+
+const questieTag = "bundle/v12.7.0+v1.0.14"
+
+func alphaZip(t *testing.T, marker string) []byte {
+	t.Helper()
+	return makeZip(t, map[string]string{"Alpha/Alpha.toc": marker})
+}
+
+func pinned(tag string) string {
+	return "[game]\nflavor = \"mainline\"\n\n[addons]\n\"github:acme/alpha\" = \"" + tag + "\"\n"
+}
+
+func TestSyncPinToQuestieStyleTagInstalls(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {
+			{Tag: "bundle/v13.0.0+v1.0.15", Assets: map[string][]byte{"a.zip": alphaZip(t, "newer")}},
+			{Tag: questieTag, Assets: map[string][]byte{"a.zip": alphaZip(t, "pinned")}},
+		},
+	})
+	e := newSyncEnv(t, gh, pinned(questieTag))
+	r := e.sync(t)
+	if r.ExitCode != 0 {
+		t.Fatalf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(e.addons, "Alpha", "Alpha.toc")); got != "pinned" {
+		t.Errorf("installed %q, want the pinned release", got)
+	}
+	l, err := lock.Load(e.lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := l.Addons["github:acme/alpha"].Tag; got != questieTag {
+		t.Errorf("locked tag = %q", got)
+	}
+}
+
+func TestSyncPinMatchesTagsExactly(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1.0.0", Assets: map[string][]byte{"a.zip": alphaZip(t, "x")}}},
+	})
+	e := newSyncEnv(t, gh, pinned("1.0.0"))
+	if r := e.sync(t); r.ExitCode != 4 {
+		t.Errorf("exit = %d, want 4; stderr = %q", r.ExitCode, r.Stderr)
+	}
+}
+
+func TestSyncPinToPrereleaseInstallsIt(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {
+			{Tag: "v2.0.0-beta.1", Prerelease: true, Assets: map[string][]byte{"a.zip": alphaZip(t, "beta")}},
+			{Tag: "v1.0.0", Assets: map[string][]byte{"a.zip": alphaZip(t, "stable")}},
+		},
+	})
+	e := newSyncEnv(t, gh, pinned("v2.0.0-beta.1"))
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(e.addons, "Alpha", "Alpha.toc")); got != "beta" {
+		t.Errorf("installed %q, want the prerelease", got)
+	}
+}
+
+func TestSyncMissingTagExitsFour(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1.0.0", Assets: map[string][]byte{"a.zip": alphaZip(t, "x")}}},
+	})
+	e := newSyncEnv(t, gh, pinned("v9.9.9"))
+	r := e.sync(t)
+	if r.ExitCode != 4 || !strings.Contains(r.Stderr, "v9.9.9") {
+		t.Errorf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+}
+
+func TestSyncKeepsLockedLatestWhenNewerReleaseAppears(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1.0.0", Assets: map[string][]byte{"a.zip": alphaZip(t, "one")}}},
+	})
+	e := newSyncEnv(t, gh, oneAddon)
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("first sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	gh.set("acme/alpha", []fakeRelease{
+		{Tag: "v2.0.0", Assets: map[string][]byte{"a.zip": alphaZip(t, "two")}},
+		{Tag: "v1.0.0", Assets: map[string][]byte{"a.zip": alphaZip(t, "one")}},
+	})
+	lookups := gh.lookups("acme/alpha")
+	before := read(t, e.lock)
+
+	// A fresh machine: the lock is there, the AddOns folder is not.
+	if err := os.RemoveAll(e.addons); err != nil {
+		t.Fatal(err)
+	}
+	r := e.sync(t)
+	if r.ExitCode != 0 {
+		t.Fatalf("second sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(e.addons, "Alpha", "Alpha.toc")); got != "one" {
+		t.Errorf("installed %q, want the locked release", got)
+	}
+	if after := read(t, e.lock); after != before {
+		t.Errorf("lock changed:\n%s\n---\n%s", before, after)
+	}
+	if got := gh.lookups("acme/alpha"); got != lookups {
+		t.Errorf("sync re-resolved a locked addon (%d lookups, had %d)", got, lookups)
+	}
+}
+
+func TestSyncChangedPinReResolvesOnlyThatAddon(t *testing.T) {
+	betaZip := func(m string) []byte { return makeZip(t, map[string]string{"Beta/b.lua": m}) }
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {
+			{Tag: "v2.0.0", Assets: map[string][]byte{"a.zip": alphaZip(t, "two")}},
+			{Tag: "v1.0.0", Assets: map[string][]byte{"a.zip": alphaZip(t, "one")}},
+		},
+		"acme/beta": {{Tag: "v1", Assets: map[string][]byte{"b.zip": betaZip("b")}}},
+	})
+	both := func(alpha string) string {
+		return pinned(alpha) + "\"github:acme/beta\" = \"latest\"\n"
+	}
+	e := newSyncEnv(t, gh, both("v1.0.0"))
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("first sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	betaLookups := gh.lookups("acme/beta")
+
+	write(t, e.manifest, both("v2.0.0"))
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("second sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(e.addons, "Alpha", "Alpha.toc")); got != "two" {
+		t.Errorf("Alpha = %q, want the new pin installed over the old", got)
+	}
+	if got := gh.lookups("acme/beta"); got != betaLookups {
+		t.Errorf("beta was re-resolved (%d lookups, had %d)", got, betaLookups)
+	}
+	l, err := lock.Load(e.lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := l.Addons["github:acme/alpha"].Tag; got != "v2.0.0" {
+		t.Errorf("locked tag = %q", got)
+	}
+}
+
+func TestSyncSecondRunMakesNoFilesystemChanges(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{"a.zip": alphaZip(t, "a")}}},
+	})
+	e := newSyncEnv(t, gh, oneAddon)
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("first sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	snap := func() map[string]string {
+		out := map[string]string{}
+		root := filepath.Dir(e.lock)
+		_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			out[p] = fmt.Sprintf("%v %d %s", info.Mode(), info.Size(), info.ModTime())
+			return nil
+		})
+		return out
+	}
+	before := snap()
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("second sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if after := snap(); !reflect.DeepEqual(before, after) {
+		t.Errorf("filesystem changed:\n%v\n---\n%v", before, after)
+	}
+}
+
+func TestSyncRefusesTamperedAssetWithExitFive(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{"a.zip": alphaZip(t, "good")}}},
+	})
+	e := newSyncEnv(t, gh, oneAddon)
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("first sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	gh.set("acme/alpha", []fakeRelease{{Tag: "v1", Assets: map[string][]byte{"a.zip": alphaZip(t, "evil")}}})
+	if err := os.RemoveAll(e.addons); err != nil {
+		t.Fatal(err)
+	}
+	r := e.sync(t)
+	if r.ExitCode != 5 {
+		t.Fatalf("exit = %d, want 5; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if !strings.Contains(r.Stderr, "wam update github:acme/alpha") {
+		t.Errorf("stderr lacks the fix command: %q", r.Stderr)
+	}
+	if _, err := os.Stat(filepath.Join(e.addons, "Alpha")); err == nil {
+		t.Error("tampered asset was installed")
 	}
 }

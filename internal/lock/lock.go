@@ -22,11 +22,14 @@ type Lock struct {
 // Entry is one locked addon.
 type Entry struct {
 	Source string `toml:"source"`
-	Repo   string `toml:"repo"`
-	Tag    string `toml:"tag"`
-	Asset  string `toml:"asset"`
-	URL    string `toml:"url"`
-	SHA256 string `toml:"sha256"`
+	// Version is the manifest version this entry was resolved for. Empty
+	// means source.Latest.
+	Version string `toml:"version"`
+	Repo    string `toml:"repo"`
+	Tag     string `toml:"tag"`
+	Asset   string `toml:"asset"`
+	URL     string `toml:"url"`
+	SHA256  string `toml:"sha256"`
 	// Folders are the top-level folders the addon owns, in the zip's casing.
 	Folders []string `toml:"folders"`
 }

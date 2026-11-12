@@ -3,9 +3,11 @@ package source
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 
 	"github.com/maddawik/wam/internal/errs"
@@ -34,37 +36,23 @@ type ghRelease struct {
 	} `json:"assets"`
 }
 
-// Resolve finds the newest non-draft, non-prerelease release of the repo id
-// ("owner/repo"). Only version "latest" is supported so far.
+// Resolve finds the release of the repo id ("owner/repo") that version names.
+// "latest" is the newest non-draft, non-prerelease release. Anything else is
+// an exact tag, matched as written, and may be a prerelease.
 func (g *GitHub) Resolve(ctx context.Context, id, version string) (Release, error) {
-	if version != "latest" {
-		return Release{}, errs.New(errs.Usage, fmt.Sprintf("pinned version %q is not supported yet; use \"latest\"", version), "wam sync --help")
+	if version == Latest {
+		return g.resolveLatest(ctx, id)
 	}
+	return g.resolveTag(ctx, id, version)
+}
+
+func (g *GitHub) resolveLatest(ctx context.Context, id string) (Release, error) {
 	url := fmt.Sprintf("%s/repos/%s/releases?per_page=100", strings.TrimRight(g.baseURL(), "/"), id)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return Release{}, err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	if g.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+g.Token)
-	}
-	resp, err := g.client().Do(req)
-	if err != nil {
-		return Release{}, errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot reach GitHub for %s", id), "")
-	}
-	defer func() { _ = resp.Body.Close() }()
-	switch {
-	case resp.StatusCode == http.StatusNotFound:
-		return Release{}, errs.New(errs.NotFound, fmt.Sprintf("github:%s does not exist", id), "")
-	case resp.StatusCode != http.StatusOK:
-		return Release{}, &errs.Error{
-			Kind: errs.Runtime, Message: fmt.Sprintf("GitHub returned %s for %s", resp.Status, id), Retryable: true,
-		}
-	}
 	var releases []ghRelease
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
-		return Release{}, errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot read GitHub's answer for %s", id), "")
+	if err := g.getJSON(ctx, url, id, &releases); errors.Is(err, errNotFound) {
+		return Release{}, errs.New(errs.NotFound, fmt.Sprintf("github:%s does not exist", id), "")
+	} else if err != nil {
+		return Release{}, err
 	}
 	for _, r := range releases {
 		if r.Draft || r.Prerelease {
@@ -73,6 +61,61 @@ func (g *GitHub) Resolve(ctx context.Context, id, version string) (Release, erro
 		return pickZip(id, r)
 	}
 	return Release{}, errs.New(errs.NotFound, fmt.Sprintf("github:%s has no published release", id), "")
+}
+
+func (g *GitHub) resolveTag(ctx context.Context, id, tag string) (Release, error) {
+	url := fmt.Sprintf("%s/repos/%s/releases/tags/%s", strings.TrimRight(g.baseURL(), "/"), id, escapeTag(tag))
+	var r ghRelease
+	err := g.getJSON(ctx, url, id, &r)
+	if err != nil && !errors.Is(err, errNotFound) {
+		return Release{}, err
+	}
+	if err != nil || r.Draft || r.Tag != tag {
+		return Release{}, errs.New(errs.NotFound, fmt.Sprintf("github:%s has no release tagged %q", id, tag), "")
+	}
+	return pickZip(id, r)
+}
+
+// escapeTag escapes each segment of tag for a URL path but keeps its slashes,
+// which GitHub's tag lookup expects.
+func escapeTag(tag string) string {
+	segs := strings.Split(tag, "/")
+	for i, s := range segs {
+		segs[i] = neturl.PathEscape(s)
+	}
+	return strings.Join(segs, "/")
+}
+
+// errNotFound is getJSON's answer for a 404.
+var errNotFound = errors.New("not found")
+
+// getJSON GETs url into out. A 404 returns errNotFound.
+func (g *GitHub) getJSON(ctx context.Context, url, id string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if g.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+g.Token)
+	}
+	resp, err := g.client().Do(req)
+	if err != nil {
+		return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot reach GitHub for %s", id), "")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return errNotFound
+	case resp.StatusCode != http.StatusOK:
+		return &errs.Error{
+			Kind: errs.Runtime, Message: fmt.Sprintf("GitHub returned %s for %s", resp.Status, id), Retryable: true,
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot read GitHub's answer for %s", id), "")
+	}
+	return nil
 }
 
 // pickZip requires r to have exactly one .zip asset.
