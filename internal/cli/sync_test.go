@@ -1139,3 +1139,13 @@ func TestSyncUndetectableDirExitsTwoSayingHowToSetIt(t *testing.T) {
 		}
 	}
 }
+
+func TestSyncWithNoHomeAndNoFileIsAUsageError(t *testing.T) {
+	e := newPathsEnv(t, "mainline")
+	delete(e.vars, "XDG_CONFIG_HOME")
+	e.home = ""
+	r := e.run(t, "sync")
+	if r.ExitCode != 2 || !strings.Contains(r.Stderr, "home directory") || !strings.Contains(r.Stderr, "-f") {
+		t.Errorf("exit = %d, stderr = %q; want usage error naming the home directory and -f", r.ExitCode, r.Stderr)
+	}
+}

@@ -13,19 +13,24 @@ import (
 
 // ConfigDir is where the manifest and lock live by default:
 // $XDG_CONFIG_HOME/wam when set, else ~/.config/wam on macOS and Linux and
-// %APPDATA%\wam on Windows.
-func ConfigDir(goos, home string, vars map[string]string) string {
+// %APPDATA%\wam on Windows. It fails when it needs the home directory and
+// home is empty.
+func ConfigDir(goos, home string, vars map[string]string) (string, error) {
 	if x := vars["XDG_CONFIG_HOME"]; x != "" {
-		return filepath.Join(x, "wam")
+		return filepath.Join(x, "wam"), nil
 	}
 	if goos == "windows" {
-		appdata := vars["APPDATA"]
-		if appdata == "" {
-			appdata = filepath.Join(home, "AppData", "Roaming")
+		if appdata := vars["APPDATA"]; appdata != "" {
+			return filepath.Join(appdata, "wam"), nil
 		}
-		return filepath.Join(appdata, "wam")
 	}
-	return filepath.Join(home, ".config", "wam")
+	if home == "" {
+		return "", errs.New(errs.Usage, "cannot find the config directory: no home directory", "wam sync -f <path to wam.toml>")
+	}
+	if goos == "windows" {
+		return filepath.Join(home, "AppData", "Roaming", "wam"), nil
+	}
+	return filepath.Join(home, ".config", "wam"), nil
 }
 
 // gameFolders maps release.json flavor names to the game's folder name.

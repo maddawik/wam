@@ -105,11 +105,11 @@ func manifestPath(cmd *cobra.Command, e Env) (string, error) {
 	if f := e.Vars["WAM_FILE"]; f != "" {
 		return f, nil
 	}
-	home := e.Home
-	if home == "" && e.Vars["XDG_CONFIG_HOME"] == "" && (e.GOOS != "windows" || e.Vars["APPDATA"] == "") {
-		return "", errs.New(errs.Usage, "cannot find the config directory: no home directory", "wam sync -f <path to wam.toml>")
+	dir, err := locate.ConfigDir(e.GOOS, e.Home, e.Vars)
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(locate.ConfigDir(e.GOOS, home, e.Vars), "wam.toml"), nil
+	return filepath.Join(dir, "wam.toml"), nil
 }
 
 // lockPath is the lock beside the manifest: wam.toml gets wam.lock.

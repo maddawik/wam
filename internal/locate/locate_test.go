@@ -27,15 +27,15 @@ func TestConfigDir(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := locate.ConfigDir(tt.goos, tt.home, tt.vars); got != tt.want {
-				t.Errorf("ConfigDir = %q, want %q", got, tt.want)
+			if got, err := locate.ConfigDir(tt.goos, tt.home, tt.vars); err != nil || got != tt.want {
+				t.Errorf("ConfigDir = %q, %v; want %q", got, err, tt.want)
 			}
 		})
 	}
 }
 
 func TestConfigDirWindowsWithoutAppdataFallsBackToHome(t *testing.T) {
-	got := locate.ConfigDir("windows", "/h", nil)
+	got, _ := locate.ConfigDir("windows", "/h", nil)
 	if want := filepath.Join("/h", "AppData", "Roaming", "wam"); got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -186,5 +186,20 @@ func TestDefaultProbeRoots(t *testing.T) {
 	want := []string{filepath.Join(`C:\Program Files (x86)`, "World of Warcraft"), filepath.Join(`C:\Program Files`, "World of Warcraft")}
 	if strings.Join(win.Roots, "|") != strings.Join(want, "|") {
 		t.Errorf("windows roots = %v, want %v", win.Roots, want)
+	}
+}
+
+func TestConfigDirWithoutHomeIsUsageErrorUnlessSomethingElseSetsIt(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux", "windows"} {
+		_, err := locate.ConfigDir(goos, "", nil)
+		if e, ok := errs.As(err); !ok || e.Kind != errs.Usage {
+			t.Errorf("%s: err = %v, want usage error", goos, err)
+		}
+	}
+	if _, err := locate.ConfigDir("linux", "", map[string]string{"XDG_CONFIG_HOME": "/x"}); err != nil {
+		t.Errorf("XDG set: %v", err)
+	}
+	if _, err := locate.ConfigDir("windows", "", map[string]string{"APPDATA": "/a"}); err != nil {
+		t.Errorf("APPDATA set: %v", err)
 	}
 }
