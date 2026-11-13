@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -39,6 +40,7 @@ func run() int {
 		vars["NO_COLOR"] = "1"
 	}
 
+	home, _ := os.UserHomeDir()
 	return cli.Execute(ctx, os.Args[1:], cli.Env{
 		Stdin:     os.Stdin,
 		Stdout:    os.Stdout,
@@ -47,6 +49,8 @@ func run() int {
 		StdoutTTY: stdoutTTY,
 		StderrTTY: stderrTTY,
 		Vars:      vars,
+		GOOS:      runtime.GOOS,
+		Home:      home,
 	}, version)
 }
 

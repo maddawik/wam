@@ -9,6 +9,7 @@ import (
 	"runtime"
 
 	"github.com/maddawik/wam/internal/errs"
+	"github.com/maddawik/wam/internal/locate"
 	"github.com/spf13/cobra"
 )
 
@@ -25,6 +26,14 @@ type Env struct {
 
 	// Vars is the environment variable map.
 	Vars map[string]string
+
+	// GOOS and Home place the default config directory. GOOS empty means
+	// the host's.
+	GOOS string
+	Home string
+	// Probe is what AddOns auto-detect looks at. Nil means the real probe
+	// for GOOS.
+	Probe *locate.Probe
 }
 
 // Execute runs the wam command tree and returns the process exit code.
@@ -34,6 +43,9 @@ type Env struct {
 func Execute(ctx context.Context, args []string, e Env, version string, extra ...*cobra.Command) (code int) {
 	if e.Vars == nil {
 		e.Vars = map[string]string{}
+	}
+	if e.GOOS == "" {
+		e.GOOS = runtime.GOOS
 	}
 	s := &IO{In: e.Stdin, Out: e.Stdout, Err: e.Stderr, env: e}
 	inv := &invocation{io: s, version: version, args: args}

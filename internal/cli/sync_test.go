@@ -21,6 +21,7 @@ import (
 
 	"github.com/maddawik/wam/internal/clitest"
 	"github.com/maddawik/wam/internal/errs"
+	"github.com/maddawik/wam/internal/locate"
 	"github.com/maddawik/wam/internal/lock"
 )
 
@@ -172,6 +173,9 @@ func sha(b []byte) string {
 
 func write(t *testing.T, path, body string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -376,15 +380,6 @@ func TestSyncRejectsZipEntriesThatEscapeTheAddOnsFolder(t *testing.T) {
 	for dir, want := range map[string]int{filepath.Dir(e.addons): 1, e.addons: 0} {
 		if got, err := os.ReadDir(dir); err != nil || len(got) != want {
 			t.Errorf("%s holds %v (err %v), want %d entries", dir, got, err, want)
-		}
-	}
-}
-
-func TestSyncWithoutFileOrDirIsAUsageError(t *testing.T) {
-	for _, args := range [][]string{{"sync"}, {"sync", "-f", "wam.toml"}} {
-		r := clitest.Run(t, clitest.Opts{Args: args})
-		if r.ExitCode != 2 {
-			t.Errorf("%v: exit = %d, want 2; stderr = %q", args, r.ExitCode, r.Stderr)
 		}
 	}
 }
@@ -1011,5 +1006,136 @@ func TestSyncReleaseWithNoZipExits5WithClearMessage(t *testing.T) {
 	r := e.sync(t)
 	if r.ExitCode != 5 || !strings.Contains(r.Stderr, "no installable zip") {
 		t.Errorf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+}
+
+// pathsEnv is a manifest in a fake config dir plus an install the probe can
+// find, so sync runs with no flags.
+type pathsEnv struct {
+	gh      *fakeServer
+	config  string
+	home    string
+	install string
+	vars    map[string]string
+}
+
+func newPathsEnv(t *testing.T, flavor string) pathsEnv {
+	t.Helper()
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{
+		"alpha.zip": makeZip(t, map[string]string{"Alpha/Alpha.toc": "x"}),
+	}}}})
+	root := t.TempDir()
+	e := pathsEnv{gh: gh, home: filepath.Join(root, "home"), install: filepath.Join(root, "wow")}
+	e.config = filepath.Join(root, "cfg", "wam")
+	e.vars = map[string]string{"WAM_GITHUB_API": gh.URL, "XDG_CONFIG_HOME": filepath.Join(root, "cfg")}
+	write(t, filepath.Join(e.config, "wam.toml"), "[game]\nflavor = \""+flavor+"\"\n\n[addons]\n\"github:acme/alpha\" = \"latest\"\n")
+	return e
+}
+
+func (e pathsEnv) run(t *testing.T, args ...string) clitest.Result {
+	t.Helper()
+	probe := locate.Probe{Roots: []string{e.install}}
+	return clitest.Run(t, clitest.Opts{Args: args, Env: e.vars, Home: e.home, Probe: &probe})
+}
+
+func TestSyncWithNoFlagsUsesConfigDirAndDetectedInstall(t *testing.T) {
+	e := newPathsEnv(t, "mainline")
+	addons := filepath.Join(e.install, "_retail_", "Interface", "AddOns")
+	if err := os.MkdirAll(filepath.Join(e.install, "_retail_"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := e.run(t, "sync")
+	if r.ExitCode != 0 {
+		t.Fatalf("exit = %d; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(addons, "Alpha", "Alpha.toc")); got != "x" {
+		t.Errorf("addon not installed to detected dir: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(e.config, "wam.lock")); err != nil {
+		t.Errorf("lock not beside the manifest in the config dir: %v", err)
+	}
+}
+
+func TestSyncConfigDirDefaultsToHomeDotConfig(t *testing.T) {
+	e := newPathsEnv(t, "mainline")
+	delete(e.vars, "XDG_CONFIG_HOME")
+	write(t, filepath.Join(e.home, ".config", "wam", "wam.toml"), oneAddon)
+	r := e.run(t, "sync", "--dir", filepath.Join(t.TempDir(), "AddOns"))
+	if r.ExitCode != 0 {
+		t.Fatalf("exit = %d; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if _, err := os.Stat(filepath.Join(e.home, ".config", "wam", "wam.lock")); err != nil {
+		t.Errorf("lock not in ~/.config/wam: %v", err)
+	}
+}
+
+func TestSyncFileFlagBeatsWamFileEnv(t *testing.T) {
+	e := newPathsEnv(t, "mainline")
+	flagFile := filepath.Join(t.TempDir(), "flag.toml")
+	envFile := filepath.Join(t.TempDir(), "env.toml")
+	write(t, flagFile, oneAddon)
+	write(t, envFile, "not toml [")
+	e.vars["WAM_FILE"] = envFile
+	if r := e.run(t, "sync", "-f", flagFile, "--dir", t.TempDir()); r.ExitCode != 0 {
+		t.Fatalf("flag: exit = %d; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	// Without the flag, WAM_FILE (invalid) is what loads.
+	if r := e.run(t, "sync", "--dir", t.TempDir()); r.ExitCode != 2 {
+		t.Errorf("env: exit = %d, want 2 for the invalid WAM_FILE; stderr = %q", r.ExitCode, r.Stderr)
+	}
+}
+
+func TestSyncDirPrecedence(t *testing.T) {
+	e := newPathsEnv(t, "mainline")
+	tmp := t.TempDir()
+	flagDir, envDir, manDir := filepath.Join(tmp, "flag"), filepath.Join(tmp, "env"), filepath.Join(tmp, "man")
+	write(t, filepath.Join(e.config, "wam.toml"),
+		"[game]\nflavor = \"mainline\"\ndir = \""+filepath.ToSlash(manDir)+"\"\n\n[addons]\n\"github:acme/alpha\" = \"latest\"\n")
+	has := func(dir string) bool { _, err := os.Stat(filepath.Join(dir, "Alpha")); return err == nil }
+	reset := func() {
+		for _, d := range []string{flagDir, envDir, manDir} {
+			_ = os.RemoveAll(d)
+		}
+		_ = os.Remove(filepath.Join(e.config, "wam.lock"))
+	}
+
+	e.vars["WAM_DIR"] = envDir
+	if r := e.run(t, "sync", "--dir", flagDir); r.ExitCode != 0 || !has(flagDir) || has(envDir) || has(manDir) {
+		t.Errorf("--dir should win: exit %d, stderr %q", r.ExitCode, r.Stderr)
+	}
+	reset()
+	if r := e.run(t, "sync"); r.ExitCode != 0 || !has(envDir) || has(manDir) {
+		t.Errorf("WAM_DIR should beat the manifest's dir: exit %d, stderr %q", r.ExitCode, r.Stderr)
+	}
+	reset()
+	delete(e.vars, "WAM_DIR")
+	if r := e.run(t, "sync"); r.ExitCode != 0 || !has(manDir) {
+		t.Errorf("manifest dir should be used: exit %d, stderr %q", r.ExitCode, r.Stderr)
+	}
+}
+
+func TestSyncUnknownFlavorExitsTwoListingValidOnes(t *testing.T) {
+	e := newPathsEnv(t, "retail")
+	r := e.run(t, "sync")
+	if r.ExitCode != 2 {
+		t.Fatalf("exit = %d, want 2; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	for _, s := range []string{`"retail"`, "mainline", "forever"} {
+		if !strings.Contains(r.Stderr, s) {
+			t.Errorf("stderr %q lacks %s", r.Stderr, s)
+		}
+	}
+}
+
+func TestSyncUndetectableDirExitsTwoSayingHowToSetIt(t *testing.T) {
+	e := newPathsEnv(t, "mainline") // no _retail_ folder under the install
+	r := e.run(t, "sync")
+	if r.ExitCode != 2 {
+		t.Fatalf("exit = %d, want 2; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	for _, s := range []string{"--dir", "WAM_DIR", "dir"} {
+		if !strings.Contains(r.Stderr, s) {
+			t.Errorf("stderr %q lacks %q", r.Stderr, s)
+		}
 	}
 }

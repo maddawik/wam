@@ -15,6 +15,7 @@ import (
 
 	"github.com/maddawik/wam/internal/errs"
 	"github.com/maddawik/wam/internal/install"
+	"github.com/maddawik/wam/internal/locate"
 	"github.com/maddawik/wam/internal/lock"
 	"github.com/maddawik/wam/internal/manifest"
 	"github.com/maddawik/wam/internal/source"
@@ -24,8 +25,8 @@ import (
 // bindPathFlags adds the flags that locate the manifest and the AddOns folder.
 func bindPathFlags(root *cobra.Command) {
 	f := root.PersistentFlags()
-	f.StringP("file", "f", "", "path to the manifest (wam.toml)")
-	f.String("dir", "", "path to the game's AddOns folder")
+	f.StringP("file", "f", "", "path to the manifest (default $WAM_FILE, else wam.toml in the config directory)")
+	f.String("dir", "", "path to the game's AddOns folder (default $WAM_DIR, the manifest's dir, then auto-detect)")
 }
 
 // syncChange is one addon sync installed or removed.
@@ -47,21 +48,36 @@ func newSync() *cobra.Command {
 			"lock already has are installed as locked and never moved to a newer\n" +
 			"release; only new entries or changed versions are resolved. Every\n" +
 			"download is checked against the lock's SHA-256.",
-		Example: "  wam sync -f wam.toml --dir \"/Applications/World of Warcraft/_retail_/Interface/AddOns\"\n" +
+		Example: "  wam sync\n  wam sync -f wam.toml --dir \"/Applications/World of Warcraft/_retail_/Interface/AddOns\"\n" +
 			"  wam sync -f wam.toml --dir ./AddOns --json",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			s := From(cmd)
-			file, _ := cmd.Flags().GetString("file")
-			dir, _ := cmd.Flags().GetString("dir")
-			if file == "" {
-				return errs.New(errs.Usage, "no manifest: pass -f <path>", "wam sync -f wam.toml --dir <AddOns>")
+			file, err := manifestPath(cmd, s.env)
+			if err != nil {
+				return err
 			}
-			if dir == "" {
-				return errs.New(errs.Usage, "no AddOns folder: pass --dir <path>", "wam sync -f wam.toml --dir <AddOns>")
+			m, err := manifest.Load(file)
+			if err != nil {
+				return err
+			}
+			if _, err := locate.GameFolder(m.Game.Flavor); err != nil {
+				return err
+			}
+			flagDir, _ := cmd.Flags().GetString("dir")
+			probe := locate.DefaultProbe(s.env.GOOS, s.env.Vars)
+			if s.env.Probe != nil {
+				probe = *s.env.Probe
+			}
+			dir, err := locate.AddOnsDir(locate.Inputs{
+				Flag: flagDir, Env: s.env.Vars["WAM_DIR"], Manifest: m.Game.Dir,
+				Flavor: m.Game.Flavor, Probe: probe,
+			})
+			if err != nil {
+				return err
 			}
 			gh := &source.GitHub{BaseURL: s.env.Vars["WAM_GITHUB_API"], Token: s.env.Vars["GITHUB_TOKEN"]}
-			changes, err := runSync(cmd.Context(), gh, file, dir)
+			changes, err := runSync(cmd.Context(), gh, m, file, dir)
 			// Report what was installed even when a later addon failed.
 			if len(changes) > 0 || err == nil {
 				if eerr := s.Emit(changes, func(w io.Writer) error {
@@ -80,6 +96,22 @@ func newSync() *cobra.Command {
 	}
 }
 
+// manifestPath is the manifest to use: -f, then WAM_FILE, then wam.toml in
+// the config directory.
+func manifestPath(cmd *cobra.Command, e Env) (string, error) {
+	if f, _ := cmd.Flags().GetString("file"); f != "" {
+		return f, nil
+	}
+	if f := e.Vars["WAM_FILE"]; f != "" {
+		return f, nil
+	}
+	home := e.Home
+	if home == "" && e.Vars["XDG_CONFIG_HOME"] == "" && (e.GOOS != "windows" || e.Vars["APPDATA"] == "") {
+		return "", errs.New(errs.Usage, "cannot find the config directory: no home directory", "wam sync -f <path to wam.toml>")
+	}
+	return filepath.Join(locate.ConfigDir(e.GOOS, home, e.Vars), "wam.toml"), nil
+}
+
 // lockPath is the lock beside the manifest: wam.toml gets wam.lock.
 func lockPath(manifestPath string) string {
 	return strings.TrimSuffix(manifestPath, filepath.Ext(manifestPath)) + ".lock"
@@ -90,11 +122,7 @@ func lockPath(manifestPath string) string {
 // skipped and the rest carry on. The lock is saved after each change, so a
 // run killed part way still records what it put in the AddOns folder.
 // One failure is returned as is, several as one runtime error naming each.
-func runSync(ctx context.Context, src source.Source, manifestPath, addonsDir string) (changes []syncChange, err error) {
-	m, err := manifest.Load(manifestPath)
-	if err != nil {
-		return nil, err
-	}
+func runSync(ctx context.Context, src source.Source, m *manifest.Manifest, manifestPath, addonsDir string) (changes []syncChange, err error) {
 	lockFile := lockPath(manifestPath)
 	l, err := lock.Load(lockFile)
 	if err != nil {
