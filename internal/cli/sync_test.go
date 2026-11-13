@@ -42,6 +42,9 @@ type fakeServer struct {
 	releases map[string]int // requests to the releases endpoints, by repo
 	// onDownload, if set, runs before an asset is served.
 	onDownload func(*http.Request)
+	// intercept, if set, sees every request first and answers it by
+	// returning true.
+	intercept func(http.ResponseWriter, *http.Request) bool
 }
 
 func fakeGitHub(t *testing.T, repos map[string][]fakeRelease) *fakeServer {
@@ -81,6 +84,9 @@ func (f *fakeServer) json(w http.ResponseWriter, repo string, r fakeRelease) map
 }
 
 func (f *fakeServer) serve(w http.ResponseWriter, req *http.Request) {
+	if f.intercept != nil && f.intercept(w, req) {
+		return
+	}
 	if f.onDownload != nil && strings.HasPrefix(req.URL.Path, "/download/") {
 		f.onDownload(req)
 	}
