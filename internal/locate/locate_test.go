@@ -3,6 +3,7 @@ package locate_test
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -201,5 +202,42 @@ func TestConfigDirWithoutHomeIsUsageErrorUnlessSomethingElseSetsIt(t *testing.T)
 	}
 	if _, err := locate.ConfigDir("windows", "", map[string]string{"APPDATA": "/a"}); err != nil {
 		t.Errorf("APPDATA set: %v", err)
+	}
+}
+
+func TestFlavorsListsInstalledGameFolders(t *testing.T) {
+	root := t.TempDir()
+	install(t, root, "_retail_")
+	install(t, root, "_classic_era_")
+	got := locate.Flavors(locate.Probe{Roots: []string{root}})
+	want := []string{"mainline", "classic"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v; want %v", got, want)
+	}
+}
+
+func TestFlavorsOfProgressionFolderListsEveryProgressionFlavor(t *testing.T) {
+	root := t.TempDir()
+	install(t, root, "_classic_")
+	got := locate.Flavors(locate.Probe{Roots: []string{root}})
+	want := []string{"bcc", "wrath", "cata", "mists", "titan"}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %v; want %v", got, want)
+	}
+}
+
+func TestFlavorsDeduplicatesAcrossRootsAndRegistry(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	install(t, a, "_retail_")
+	install(t, b, "_retail_")
+	probe := locate.Probe{Roots: []string{a}, Registry: func() []string { return []string{b} }}
+	if got := locate.Flavors(probe); !slices.Equal(got, []string{"mainline"}) {
+		t.Errorf("got %v", got)
+	}
+}
+
+func TestFlavorsNoneInstalled(t *testing.T) {
+	if got := locate.Flavors(locate.Probe{Roots: []string{t.TempDir()}}); len(got) != 0 {
+		t.Errorf("got %v", got)
 	}
 }

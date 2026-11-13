@@ -94,6 +94,40 @@ func DefaultProbe(goos string, vars map[string]string) Probe {
 	return Probe{}
 }
 
+// flavorOrder is the order Flavors reports game folders in.
+var flavorOrder = []struct {
+	folder  string
+	flavors []string
+}{
+	{"_retail_", []string{"mainline"}},
+	{"_classic_era_", []string{"classic"}},
+	{"_forever_", []string{"forever"}},
+	// The client keeps one progression install, and the folder doesn't say
+	// which expansion it holds, so every progression flavor is a candidate.
+	{"_classic_", []string{"bcc", "wrath", "cata", "mists", "titan"}},
+}
+
+// Flavors lists the flavors with a game folder under any of the probe's
+// install roots, without repeats.
+func Flavors(p Probe) []string {
+	roots := slices.Clone(p.Roots)
+	if p.Registry != nil {
+		for _, r := range p.Registry() {
+			roots = append(roots, installRoot(r))
+		}
+	}
+	var out []string
+	for _, f := range flavorOrder {
+		for _, root := range roots {
+			if st, err := os.Stat(filepath.Join(root, f.folder)); err == nil && st.IsDir() {
+				out = append(out, f.flavors...)
+				break
+			}
+		}
+	}
+	return out
+}
+
 // Inputs are the sources of the AddOns dir, highest precedence first.
 type Inputs struct {
 	Flag     string // --dir
