@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -1056,16 +1057,21 @@ func TestSyncWithNoFlagsUsesConfigDirAndDetectedInstall(t *testing.T) {
 	}
 }
 
-func TestSyncConfigDirDefaultsToHomeDotConfig(t *testing.T) {
+func TestSyncConfigDirDefaultsToTheHomeConfigDir(t *testing.T) {
 	e := newPathsEnv(t, "mainline")
 	delete(e.vars, "XDG_CONFIG_HOME")
-	write(t, filepath.Join(e.home, ".config", "wam", "wam.toml"), oneAddon)
+	// ~/.config/wam, or ~/AppData/Roaming/wam on Windows when APPDATA is unset.
+	cfg := filepath.Join(e.home, ".config", "wam")
+	if runtime.GOOS == "windows" {
+		cfg = filepath.Join(e.home, "AppData", "Roaming", "wam")
+	}
+	write(t, filepath.Join(cfg, "wam.toml"), oneAddon)
 	r := e.run(t, "sync", "--dir", filepath.Join(t.TempDir(), "AddOns"))
 	if r.ExitCode != 0 {
 		t.Fatalf("exit = %d; stderr = %q", r.ExitCode, r.Stderr)
 	}
-	if _, err := os.Stat(filepath.Join(e.home, ".config", "wam", "wam.lock")); err != nil {
-		t.Errorf("lock not in ~/.config/wam: %v", err)
+	if _, err := os.Stat(filepath.Join(cfg, "wam.lock")); err != nil {
+		t.Errorf("lock not in %s: %v", cfg, err)
 	}
 }
 
