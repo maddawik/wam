@@ -871,3 +871,139 @@ func TestSyncInterruptedPartWayLocksWhatItInstalled(t *testing.T) {
 	}
 	assertNoTempFiles(t, e.addons)
 }
+
+// releaseJSON is modelled on the BigWigs packager's release.json, as shipped
+// by DialogKey_Numy: one entry per zip, each listing the flavors it supports.
+func releaseJSON(t *testing.T, entries map[string][]string) []byte {
+	t.Helper()
+	type meta struct {
+		Flavor    string `json:"flavor"`
+		Interface int    `json:"interface"`
+	}
+	type rel struct {
+		Name     string `json:"name"`
+		Filename string `json:"filename"`
+		NoLib    bool   `json:"nolib"`
+		Metadata []meta `json:"metadata"`
+	}
+	var out struct {
+		Releases []rel `json:"releases"`
+	}
+	for file, flavors := range entries {
+		r := rel{Name: "Addon", Filename: file}
+		for _, f := range flavors {
+			r.Metadata = append(r.Metadata, meta{Flavor: f, Interface: 50500})
+		}
+		out.Releases = append(out.Releases, r)
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func entryWith(spec string, flavor string) string {
+	return "[game]\nflavor = \"" + flavor + "\"\n\n[addons]\n\"github:acme/alpha\" = " + spec + "\n"
+}
+
+func zipMarker(t *testing.T, marker string) []byte {
+	return makeZip(t, map[string]string{"Alpha/Alpha.toc": marker})
+}
+
+func TestSyncPicksZipFromReleaseJSONForManifestFlavor(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{
+		"Alpha-v1-mainline.zip": zipMarker(t, "mainline"),
+		"Alpha-v1-forever.zip":  zipMarker(t, "forever"),
+		"release.json": releaseJSON(t, map[string][]string{
+			"Alpha-v1-mainline.zip": {"mainline"},
+			"Alpha-v1-forever.zip":  {"forever"},
+		}),
+	}}}})
+	e := newSyncEnv(t, gh, entryWith(`"latest"`, "forever"))
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(e.addons, "Alpha", "Alpha.toc")); got != "forever" {
+		t.Errorf("installed %q, want forever", got)
+	}
+}
+
+func TestSyncAssetGlobOverridesReleaseJSON(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{
+		"Alpha-v1-mainline.zip": zipMarker(t, "mainline"),
+		"Alpha-v1-forever.zip":  zipMarker(t, "forever"),
+		"release.json": releaseJSON(t, map[string][]string{
+			"Alpha-v1-mainline.zip": {"mainline"},
+			"Alpha-v1-forever.zip":  {"forever"},
+		}),
+	}}}})
+	e := newSyncEnv(t, gh, entryWith(`{ version = "latest", asset = "*-mainline.zip" }`, "forever"))
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(e.addons, "Alpha", "Alpha.toc")); got != "mainline" {
+		t.Errorf("installed %q, want mainline", got)
+	}
+}
+
+func TestSyncUsesOnlyZipWithoutReleaseJSON(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{
+		"Alpha.zip": zipMarker(t, "only"), "notes.txt": []byte("hi"),
+	}}}})
+	e := newSyncEnv(t, gh, oneAddon)
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+}
+
+func TestSyncAmbiguousReleaseExits5AndListsCandidates(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{
+		"Alpha-a.zip": zipMarker(t, "a"), "Alpha-b.zip": zipMarker(t, "b"),
+	}}}})
+	e := newSyncEnv(t, gh, oneAddon)
+	r := e.sync(t)
+	if r.ExitCode != 5 {
+		t.Fatalf("exit = %d, want 5; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	for _, want := range []string{"Alpha-a.zip", "Alpha-b.zip", "asset"} {
+		if !strings.Contains(r.Stderr, want) {
+			t.Errorf("stderr %q lacks %q", r.Stderr, want)
+		}
+	}
+}
+
+func TestSyncReleaseJSONWithoutMatchingFlavorExits5(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{
+		"Alpha-a.zip": zipMarker(t, "a"), "Alpha-b.zip": zipMarker(t, "b"),
+		"release.json": releaseJSON(t, map[string][]string{"Alpha-a.zip": {"mainline"}, "Alpha-b.zip": {"classic"}}),
+	}}}})
+	e := newSyncEnv(t, gh, entryWith(`"latest"`, "forever"))
+	r := e.sync(t)
+	if r.ExitCode != 5 || !strings.Contains(r.Stderr, "Alpha-a.zip") || !strings.Contains(r.Stderr, "Alpha-b.zip") {
+		t.Errorf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+}
+
+func TestSyncAssetGlobMatchingNothingOrSeveralExits5(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{
+		"Alpha-a.zip": zipMarker(t, "a"), "Alpha-b.zip": zipMarker(t, "b"),
+	}}}})
+	for _, glob := range []string{"*.tar.gz", "Alpha-*.zip"} {
+		e := newSyncEnv(t, gh, entryWith(`{ version = "latest", asset = "`+glob+`" }`, "mainline"))
+		if r := e.sync(t); r.ExitCode != 5 {
+			t.Errorf("glob %q: exit = %d, stderr = %q", glob, r.ExitCode, r.Stderr)
+		}
+	}
+}
+
+func TestSyncReleaseWithNoZipExits5WithClearMessage(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{
+		"notes.txt": []byte("hi"),
+	}}}})
+	e := newSyncEnv(t, gh, oneAddon)
+	r := e.sync(t)
+	if r.ExitCode != 5 || !strings.Contains(r.Stderr, "no installable zip") {
+		t.Errorf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+}
