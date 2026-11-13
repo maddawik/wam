@@ -29,11 +29,13 @@ func bindPathFlags(root *cobra.Command) {
 	f.String("dir", "", "path to the game's AddOns folder (default $WAM_DIR, the manifest's dir, then auto-detect)")
 }
 
-// syncChange is one addon sync installed or removed.
+// syncChange is one addon installed, added or removed.
 type syncChange struct {
-	// Action is "installed" or "removed".
-	Action  string   `json:"action"`
-	Addon   string   `json:"addon"`
+	// Action is "installed", "added" or "removed".
+	Action string `json:"action"`
+	Addon  string `json:"addon"`
+	// Version is the manifest version, set by add.
+	Version string   `json:"version,omitempty"`
 	Tag     string   `json:"tag"`
 	Folders []string `json:"folders"`
 }
@@ -53,26 +55,15 @@ func newSync() *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			s := From(cmd)
-			file, err := manifestPath(cmd, s.env)
+			p, err := openProject(cmd)
 			if err != nil {
 				return err
 			}
-			m, err := manifest.Load(file)
+			dir, err := p.dir()
 			if err != nil {
 				return err
 			}
-			if _, err := locate.GameFolder(m.Game.Flavor); err != nil {
-				return err
-			}
-			flagDir, _ := cmd.Flags().GetString("dir")
-			dir, err := locate.AddOnsDir(locate.Inputs{
-				Flag: flagDir, Env: s.env.Vars["WAM_DIR"], Manifest: m.Game.Dir,
-				Flavor: m.Game.Flavor, Probe: probeFor(s.env),
-			})
-			if err != nil {
-				return err
-			}
-			gh := &source.GitHub{BaseURL: s.env.Vars["WAM_GITHUB_API"], Token: s.env.Vars["GITHUB_TOKEN"]}
+			file, m, gh := p.file, p.m, p.gh
 			changes, err := runSync(cmd.Context(), gh, m, file, dir)
 			// Report what was installed even when a later addon failed.
 			if len(changes) > 0 || err == nil {
