@@ -86,7 +86,8 @@ func lockPath(manifestPath string) string {
 
 // runSync removes the folders of addons the manifest dropped, then installs
 // every manifest addon the lock doesn't have yet. An addon that fails is
-// skipped and the rest carry on; the lock is saved for whatever succeeded.
+// skipped and the rest carry on. The lock is saved after each change, so a
+// run killed part way still records what it put in the AddOns folder.
 // One failure is returned as is, several as one runtime error naming each.
 func runSync(ctx context.Context, src source.Source, manifestPath, addonsDir string) (changes []syncChange, err error) {
 	m, err := manifest.Load(manifestPath)
@@ -98,19 +99,27 @@ func runSync(ctx context.Context, src source.Source, manifestPath, addonsDir str
 	if err != nil {
 		return nil, err
 	}
+	if err := os.MkdirAll(addonsDir, 0o755); err != nil {
+		return nil, errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot create %s", addonsDir), "")
+	}
+	// Undo whatever a crashed run left half done before changing anything.
+	if err := install.Recover(addonsDir); err != nil {
+		return nil, err
+	}
 	changes = []syncChange{}
 	var failed []*errs.Error
 	defer func() {
 		if err == nil {
 			err = failure(failed, len(changes) > 0)
 		}
-		if len(changes) == 0 {
-			return
-		}
-		if serr := lock.Save(lockFile, l); serr != nil && err == nil {
-			err = errs.Wrap(errs.Runtime, serr, fmt.Sprintf("cannot write lock %s", lockFile), "")
-		}
 	}()
+	record := func(c syncChange) error {
+		changes = append(changes, c)
+		if err := lock.Save(lockFile, l); err != nil {
+			return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot write lock %s", lockFile), "")
+		}
+		return nil
+	}
 
 	wanted := map[string]bool{}
 	for _, a := range m.Addons {
@@ -124,12 +133,14 @@ func runSync(ctx context.Context, src source.Source, manifestPath, addonsDir str
 		if ctx.Err() != nil {
 			return changes, ctx.Err()
 		}
-		if err := removeFolders(addonsDir, e.Folders); err != nil {
+		if err := install.Remove(addonsDir, e.Folders); err != nil {
 			failed = append(failed, addonError(key, err))
 			continue
 		}
 		delete(l.Addons, key)
-		changes = append(changes, syncChange{Action: "removed", Addon: key, Tag: e.Tag, Folders: e.Folders})
+		if err := record(syncChange{Action: "removed", Addon: key, Tag: e.Tag, Folders: e.Folders}); err != nil {
+			return changes, err
+		}
 	}
 
 	for _, a := range m.Addons {
@@ -154,7 +165,9 @@ func runSync(ctx context.Context, src source.Source, manifestPath, addonsDir str
 			continue
 		}
 		l.Addons[a.Key] = entry
-		changes = append(changes, syncChange{Action: "installed", Addon: a.Key, Tag: entry.Tag, Folders: entry.Folders})
+		if err := record(syncChange{Action: "installed", Addon: a.Key, Tag: entry.Tag, Folders: entry.Folders}); err != nil {
+			return changes, err
+		}
 	}
 	return changes, nil
 }
@@ -178,20 +191,6 @@ func syncAddon(ctx context.Context, src source.Source, a manifest.Addon, locked 
 	}
 	err = restoreAddon(ctx, src, a.Key, *locked, addonsDir, ownerOf)
 	return *locked, err == nil, err
-}
-
-// removeFolders deletes folders, which the lock says an addon owns, from
-// addonsDir. A name that isn't a single local path element is refused.
-func removeFolders(addonsDir string, folders []string) error {
-	for _, f := range folders {
-		if !filepath.IsLocal(f) || filepath.Base(f) != f {
-			return errs.New(errs.Conflict, fmt.Sprintf("lock lists folder %q, which is not a folder in the AddOns folder", f), "")
-		}
-		if err := os.RemoveAll(filepath.Join(addonsDir, f)); err != nil {
-			return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot remove %s from %s", f, addonsDir), "")
-		}
-	}
-	return nil
 }
 
 // failure is the error for a run in which failed went wrong: nil for none,
@@ -252,7 +251,7 @@ func installed(addonsDir string, folders []string) bool {
 // restoreAddon installs the release the lock records, without asking the host
 // what is newest. The download must match the lock's hash.
 func restoreAddon(ctx context.Context, src source.Source, key string, e lock.Entry, addonsDir string, ownerOf install.OwnerFunc) error {
-	zipPath, sum, cleanup, err := fetch(ctx, src, e.URL)
+	zipPath, sum, cleanup, err := fetch(ctx, src, e.URL, addonsDir)
 	if err != nil {
 		return err
 	}
@@ -262,7 +261,7 @@ func restoreAddon(ctx context.Context, src source.Source, key string, e lock.Ent
 			fmt.Sprintf("%s does not match the lock's SHA-256; the asset changed since it was locked", e.Tag),
 			"wam update "+key)
 	}
-	_, err = install.Zip(zipPath, addonsDir, e.Folders, ownerOf)
+	_, err = install.Zip(ctx, zipPath, addonsDir, e.Folders, ownerOf)
 	return err
 }
 
@@ -273,12 +272,12 @@ func installAddon(ctx context.Context, src source.Source, a manifest.Addon, addo
 	if err != nil {
 		return lock.Entry{}, err
 	}
-	zipPath, sum, cleanup, err := fetch(ctx, src, rel.URL)
+	zipPath, sum, cleanup, err := fetch(ctx, src, rel.URL, addonsDir)
 	if err != nil {
 		return lock.Entry{}, err
 	}
 	defer cleanup()
-	folders, err := install.Zip(zipPath, addonsDir, owned, ownerOf)
+	folders, err := install.Zip(ctx, zipPath, addonsDir, owned, ownerOf)
 	if err != nil {
 		return lock.Entry{}, err
 	}
@@ -288,10 +287,10 @@ func installAddon(ctx context.Context, src source.Source, a manifest.Addon, addo
 	}, nil
 }
 
-// fetch downloads url to a temp file, hashing it on the way. Call cleanup to
-// delete the file.
-func fetch(ctx context.Context, src source.Source, url string) (path, sum string, cleanup func(), err error) {
-	tmp, err := os.CreateTemp("", "wam-*.zip")
+// fetch downloads url to a temp file in addonsDir, hashing it on the way.
+// Call cleanup to delete the file; install.Recover deletes it after a crash.
+func fetch(ctx context.Context, src source.Source, url, addonsDir string) (path, sum string, cleanup func(), err error) {
+	tmp, err := os.CreateTemp(addonsDir, install.TempPattern+".zip")
 	if err != nil {
 		return "", "", nil, errs.Wrap(errs.Runtime, err, "cannot create a temp file", "")
 	}
