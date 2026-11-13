@@ -94,6 +94,30 @@ func Zip(ctx context.Context, zipPath, addonsDir string, owned []string, ownerOf
 	return folders, nil
 }
 
+// Plan returns the top-level folders the zip at zipPath would install, in its
+// casing, after the checks Zip makes, without writing anything. addonsDir
+// need not exist.
+func Plan(zipPath, addonsDir string, owned []string, ownerOf OwnerFunc) ([]string, error) {
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return nil, errs.Wrap(errs.Runtime, err, "downloaded file is not a valid zip", "")
+	}
+	defer func() { _ = zr.Close() }()
+	for _, f := range owned {
+		if !isFolderName(f) {
+			return nil, badFolder(f)
+		}
+	}
+	folders, err := checkEntries(zr)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkOwnership(folders, addonsDir, owned, ownerOf); err != nil {
+		return nil, err
+	}
+	return folders, nil
+}
+
 // swap replaces the owned folders in addonsDir with folders from src.
 func swap(addonsDir, src string, owned, folders []string) error {
 	backup, err := os.MkdirTemp(addonsDir, oldPrefix)
@@ -267,7 +291,7 @@ func checkOwnership(folders []string, addonsDir string, owned []string, ownerOf 
 	}
 	present := map[string]bool{}
 	entries, err := os.ReadDir(addonsDir)
-	if err != nil {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot read %s", addonsDir), "")
 	}
 	for _, e := range entries {

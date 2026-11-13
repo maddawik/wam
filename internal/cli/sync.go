@@ -41,7 +41,7 @@ type syncChange struct {
 }
 
 func newSync() *cobra.Command {
-	return &cobra.Command{
+	c := &cobra.Command{
 		Use:   "sync",
 		Short: "Install the manifest's addons into the AddOns folder",
 		Long: "Install the manifest's addons into the AddOns folder and record what\n" +
@@ -49,7 +49,7 @@ func newSync() *cobra.Command {
 			"is \"latest\" or an exact release tag, matched as written. Addons the\n" +
 			"lock already has are installed as locked and never moved to a newer\n" +
 			"release; only new entries or changed versions are resolved. Every\n" +
-			"download is checked against the lock's SHA-256.",
+			"download is checked against the lock's SHA-256." + previewHelp,
 		Example: "  wam sync\n  wam sync -f wam.toml --dir \"/Applications/World of Warcraft/_retail_/Interface/AddOns\"\n" +
 			"  wam sync -f wam.toml --dir ./AddOns --json",
 		Args: cobra.NoArgs,
@@ -64,6 +64,13 @@ func newSync() *cobra.Command {
 				return err
 			}
 			file, m, gh := p.file, p.m, p.gh
+			if wantsPreview(cmd) {
+				changes, err := planSync(cmd.Context(), gh, m, file, dir)
+				if eerr := emitPlan(s, changes); err == nil {
+					err = eerr
+				}
+				return err
+			}
 			changes, err := runSync(cmd.Context(), gh, m, file, dir)
 			// Report what was installed even when a later addon failed.
 			if len(changes) > 0 || err == nil {
@@ -81,6 +88,8 @@ func newSync() *cobra.Command {
 			return err
 		},
 	}
+	bindPreview(c)
+	return c
 }
 
 // manifestPath is the manifest to use: -f, then WAM_FILE, then wam.toml in

@@ -80,7 +80,7 @@ func newAdd() *cobra.Command {
 		Long: "Add an addon to the manifest, resolve and lock it, and install it, in one\n" +
 			"step. It follows the latest release unless --pin names an exact release\n" +
 			"tag. If the addon can't be found or installed, the manifest and lock are\n" +
-			"left as they were.",
+			"left as they were." + previewHelp,
 		Example: "  wam add github:owner/repo\n  wam add github:owner/repo --pin v1.2.3",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -111,6 +111,15 @@ func newAdd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if wantsPreview(cmd) {
+				a := manifest.Addon{Key: key, Source: "github", ID: id, Version: version}
+				ownerOf := func(folder string) (string, bool) { return l.Owner(folder, key) }
+				tag, folders, err := previewAddon(cmd.Context(), p.gh, p.m.Game.Flavor, a, dir, nil, ownerOf)
+				if err != nil {
+					return addonError(key, err)
+				}
+				return emitPlan(s, []planChange{{Action: "add", Addon: key, Version: version, To: tag, Adds: folders, Removes: []string{}}})
+			}
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot create %s", dir), "")
 			}
@@ -135,16 +144,19 @@ func newAdd() *cobra.Command {
 		},
 	}
 	c.Flags().String("pin", "", "install this exact release tag instead of the latest")
+	bindPreview(c)
 	return c
 }
 
 func newRemove() *cobra.Command {
-	return &cobra.Command{
+	c := &cobra.Command{
 		Use:   "remove <addon>",
 		Short: "Remove an addon and its folders",
 		Long: "Remove an addon from the manifest and the lock, and delete the folders it\n" +
 			"owns from the AddOns folder. It doesn't ask first: addon folders can be\n" +
-			"installed again, and settings live in WTF.",
+			"installed again, and settings live in WTF.\n\n" +
+			"--preview (-n) lists what would be removed and changes nothing. It doesn't\n" +
+			"use the network.",
 		Example: "  wam remove github:owner/repo",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -164,6 +176,9 @@ func newRemove() *cobra.Command {
 				return err
 			}
 			entry, locked := l.Addons[key]
+			if wantsPreview(cmd) {
+				return emitPlan(s, []planChange{{Action: "remove", Addon: key, From: entry.Tag, Adds: []string{}, Removes: append([]string{}, entry.Folders...)}})
+			}
 			if locked && len(entry.Folders) > 0 {
 				dir, err := p.dir()
 				if err != nil {
@@ -186,4 +201,6 @@ func newRemove() *cobra.Command {
 			return emitChange(s, syncChange{Action: "removed", Addon: key, Tag: entry.Tag, Folders: entry.Folders})
 		},
 	}
+	bindPreview(c)
+	return c
 }
