@@ -11,7 +11,9 @@ import (
 	neturl "net/url"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/maddawik/wam/internal/errs"
 )
@@ -111,21 +113,61 @@ func (g *GitHub) getJSON(ctx context.Context, url, id string, out any) error {
 	}
 	resp, err := g.client().Do(req)
 	if err != nil {
-		return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot reach GitHub for %s", id), "")
+		return networkError(err, fmt.Sprintf("cannot reach GitHub for %s", id))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		return errNotFound
 	case resp.StatusCode != http.StatusOK:
-		return &errs.Error{
-			Kind: errs.Runtime, Message: fmt.Sprintf("GitHub returned %s for %s", resp.Status, id), Retryable: true,
-		}
+		return statusError(resp, id, g.Token != "")
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot read GitHub's answer for %s", id), "")
 	}
 	return nil
+}
+
+// networkError is a failure to talk to GitHub at all. Trying again may work.
+func networkError(err error, message string) *errs.Error {
+	e := errs.Wrap(errs.Runtime, err, message, "")
+	e.Retryable = true
+	return e
+}
+
+// statusError classifies an unexpected GitHub status: a rate limit (exit 1,
+// retryable once the limit resets), a rejected or insufficient token (exit 3),
+// or any other upstream failure (exit 1, retryable).
+func statusError(resp *http.Response, id string, hadToken bool) *errs.Error {
+	h := resp.Header
+	remaining := h.Get("X-RateLimit-Remaining")
+	limited := resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode == http.StatusForbidden && (remaining == "0" || h.Get("Retry-After") != ""))
+	switch {
+	case limited:
+		msg := fmt.Sprintf("GitHub rate limit reached for %s", id)
+		if remaining != "" {
+			msg += fmt.Sprintf(": %s requests left", remaining)
+		}
+		if reset, err := strconv.ParseInt(h.Get("X-RateLimit-Reset"), 10, 64); err == nil {
+			msg += ", resets at " + time.Unix(reset, 0).UTC().Format(time.RFC3339)
+		} else if after := h.Get("Retry-After"); after != "" {
+			msg += ", retry after " + after + "s"
+		}
+		msg += "; set GITHUB_TOKEN to raise the limit"
+		return &errs.Error{Kind: errs.Runtime, Code: "rate_limited", Message: msg, Retryable: true}
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		msg := fmt.Sprintf("GitHub refused access to %s", id)
+		if hadToken {
+			msg += ": GITHUB_TOKEN was rejected or lacks access; set a valid token"
+		} else {
+			msg += ": the repo needs authentication; set GITHUB_TOKEN"
+		}
+		return errs.New(errs.Auth, msg, "")
+	}
+	return &errs.Error{
+		Kind: errs.Runtime, Message: fmt.Sprintf("GitHub returned %s for %s", resp.Status, id), Retryable: true,
+	}
 }
 
 // releaseJSON is the part of the BigWigs packager's release.json that wam
@@ -226,14 +268,18 @@ func (g *GitHub) Download(ctx context.Context, url string, w io.Writer) error {
 	}
 	resp, err := g.client().Do(req)
 	if err != nil {
-		return errs.Wrap(errs.Runtime, err, "download failed", "")
+		return networkError(err, "download failed")
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return &errs.Error{Kind: errs.Runtime, Message: fmt.Sprintf("download returned %s", resp.Status), Retryable: true}
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return errs.New(errs.NotFound, "download not found: "+url, "")
+	default:
+		return statusError(resp, "download "+url, false)
 	}
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		return errs.Wrap(errs.Runtime, err, "download failed", "")
+		return networkError(err, "download failed")
 	}
 	return nil
 }
