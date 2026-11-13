@@ -259,6 +259,10 @@ func TestSyncInstallsLatestReleaseAndWritesLock(t *testing.T) {
 		URL:    gh.URL + "/download/acme/alpha/v2.0.0/Alpha-v2.0.0.zip",
 		SHA256: sha(zipBytes), Folders: []string{"Alpha", "AlphaOptions"},
 	}
+	if got.Tree == "" {
+		t.Error("lock entry has no tree hash")
+	}
+	want.Tree = got.Tree
 	slices.Sort(got.Folders)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("lock entry = %+v, want %+v", got, want)

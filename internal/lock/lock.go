@@ -35,6 +35,9 @@ type Entry struct {
 	SHA256  string `toml:"sha256"`
 	// Folders are the top-level folders the addon owns, in the zip's casing.
 	Folders []string `toml:"folders"`
+	// Tree is the install.Digest of Folders as installed. Empty in locks
+	// written before it was recorded.
+	Tree string `toml:"tree"`
 }
 
 // Owner returns the key of the addon, other than except, that owns folder.

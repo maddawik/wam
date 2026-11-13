@@ -318,9 +318,13 @@ func installAddon(ctx context.Context, src source.Source, flavor string, a manif
 	if err != nil {
 		return lock.Entry{}, err
 	}
+	tree, err := install.Digest(addonsDir, folders)
+	if err != nil {
+		return lock.Entry{}, err
+	}
 	return lock.Entry{
 		Source: a.Source, Repo: a.ID, Version: a.Version, Tag: rel.Tag, Asset: rel.Asset, URL: rel.URL,
-		SHA256: sum, Folders: folders,
+		SHA256: sum, Folders: folders, Tree: tree,
 	}, nil
 }
 
