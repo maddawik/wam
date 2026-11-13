@@ -567,3 +567,171 @@ func TestSyncRefusesTamperedAssetWithExitFive(t *testing.T) {
 		t.Error("tampered asset was installed")
 	}
 }
+
+func twoAddons(alpha, beta string) string {
+	return "[game]\nflavor = \"mainline\"\n\n[addons]\n" + alpha + beta
+}
+
+const (
+	alphaLine = "\"github:acme/alpha\" = \"latest\"\n"
+	betaLine  = "\"github:acme/beta\" = \"latest\"\n"
+)
+
+func TestSyncRefusesAFolderAnotherAddonOwnsIgnoringCase(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{"a.zip": makeZip(t, map[string]string{"Questie/a.lua": "alpha"})}}},
+		"acme/beta":  {{Tag: "v1", Assets: map[string][]byte{"b.zip": makeZip(t, map[string]string{"questie/b.lua": "beta"})}}},
+	})
+	e := newSyncEnv(t, gh, twoAddons(alphaLine, ""))
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("first sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	write(t, e.manifest, twoAddons(alphaLine, betaLine))
+
+	r := e.sync(t)
+	if r.ExitCode != 5 {
+		t.Fatalf("exit = %d, want 5; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	for _, want := range []string{"github:acme/beta", "questie", "github:acme/alpha"} {
+		if !strings.Contains(r.Stderr, want) {
+			t.Errorf("stderr lacks %q: %q", want, r.Stderr)
+		}
+	}
+	if got := read(t, filepath.Join(e.addons, "Questie", "a.lua")); got != "alpha" {
+		t.Errorf("alpha's folder was touched: %q", got)
+	}
+	l, err := lock.Load(e.lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := l.Addons["github:acme/beta"]; ok {
+		t.Error("beta was locked although its install was refused")
+	}
+}
+
+func TestSyncRefusesAnUnmanagedFolderIgnoringCase(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{"a.zip": makeZip(t, map[string]string{"Questie/a.lua": "new"})}}},
+	})
+	e := newSyncEnv(t, gh, oneAddon)
+	if err := os.MkdirAll(filepath.Join(e.addons, "questie"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(e.addons, "questie", "mine.lua"), "mine")
+
+	r := e.sync(t)
+	if r.ExitCode != 5 || !strings.Contains(r.Stderr, "Questie") || !strings.Contains(r.Stderr, "unmanaged") {
+		t.Errorf("exit = %d, want 5 naming the folder as unmanaged; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(e.addons, "questie", "mine.lua")); got != "mine" {
+		t.Errorf("unmanaged folder was touched: %q", got)
+	}
+	entries, err := os.ReadDir(e.addons)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("AddOns has %d entries, want only the unmanaged folder", len(entries))
+	}
+}
+
+func TestSyncRemovesExactlyTheDroppedAddonsFolders(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{"a.zip": makeZip(t, map[string]string{
+			"Alpha/a.lua": "a", "AlphaOptions/o.lua": "o",
+		})}}},
+		"acme/beta": {{Tag: "v1", Assets: map[string][]byte{"b.zip": makeZip(t, map[string]string{"Beta/b.lua": "b"})}}},
+	})
+	e := newSyncEnv(t, gh, twoAddons(alphaLine, betaLine))
+	if err := os.MkdirAll(filepath.Join(e.addons, "Handmade"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if r := e.sync(t); r.ExitCode != 0 {
+		t.Fatalf("first sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+
+	write(t, e.manifest, twoAddons("", betaLine))
+	r := e.sync(t)
+	if r.ExitCode != 0 {
+		t.Fatalf("second sync: exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if !strings.Contains(r.Stdout, "removed github:acme/alpha") {
+		t.Errorf("stdout = %q, want the removal reported", r.Stdout)
+	}
+	var left []string
+	entries, err := os.ReadDir(e.addons)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range entries {
+		left = append(left, d.Name())
+	}
+	if want := []string{"Beta", "Handmade"}; !reflect.DeepEqual(left, want) {
+		t.Errorf("AddOns = %v, want %v", left, want)
+	}
+	l, err := lock.Load(e.lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := l.Addons["github:acme/alpha"]; ok {
+		t.Error("dropped addon is still in the lock")
+	}
+	if _, ok := l.Addons["github:acme/beta"]; !ok {
+		t.Error("beta was removed from the lock")
+	}
+}
+
+func TestSyncKeepsGoingPastAFailingAddon(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/beta": {{Tag: "v1", Assets: map[string][]byte{"b.zip": makeZip(t, map[string]string{"Beta/b.lua": "b"})}}},
+	})
+	e := newSyncEnv(t, gh, twoAddons(alphaLine, betaLine))
+
+	r := e.sync(t)
+	if r.ExitCode != 1 || !strings.Contains(r.Stderr, "github:acme/alpha") {
+		t.Errorf("exit = %d, stderr = %q; want 1 naming alpha", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(e.addons, "Beta", "b.lua")); got != "b" {
+		t.Errorf("Beta = %q", got)
+	}
+	if !strings.Contains(r.Stdout, "installed github:acme/beta v1") {
+		t.Errorf("stdout = %q, want beta reported", r.Stdout)
+	}
+	l, err := lock.Load(e.lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := l.Addons["github:acme/beta"]; !ok {
+		t.Error("beta not locked")
+	}
+}
+
+func TestSyncSummarisesEveryFailureAndExitsOne(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/beta":  {{Tag: "v1", Assets: map[string][]byte{"b.zip": makeZip(t, map[string]string{"Beta/b.lua": "b"})}}},
+		"acme/gamma": {{Tag: "v1", Assets: map[string][]byte{"g.zip": makeZip(t, map[string]string{"Handmade/g.lua": "g"})}}},
+	})
+	e := newSyncEnv(t, gh, twoAddons(alphaLine, betaLine)+"\"github:acme/gamma\" = \"latest\"\n")
+	if err := os.MkdirAll(filepath.Join(e.addons, "Handmade"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, asJSON := range []bool{false, true} {
+		var extra []string
+		if asJSON {
+			extra = []string{"--json"}
+		}
+		r := e.sync(t, extra...)
+		if r.ExitCode != 1 {
+			t.Errorf("json=%v: exit = %d, want 1; stderr = %q", asJSON, r.ExitCode, r.Stderr)
+		}
+		for _, want := range []string{"github:acme/alpha", "github:acme/gamma", "Handmade"} {
+			if !strings.Contains(r.Stderr, want) {
+				t.Errorf("json=%v: stderr lacks %q: %q", asJSON, want, r.Stderr)
+			}
+		}
+	}
+	if _, err := os.Stat(filepath.Join(e.addons, "Beta", "b.lua")); err != nil {
+		t.Errorf("beta not installed: %v", err)
+	}
+}
