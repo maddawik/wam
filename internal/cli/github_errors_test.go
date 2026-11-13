@@ -150,3 +150,64 @@ func TestSyncTakesNoTokenArgument(t *testing.T) {
 		t.Errorf("exit = %d, want 2 (unknown flag)", r.ExitCode)
 	}
 }
+
+func TestSyncRejectsUnauthenticatedWithTokenHint(t *testing.T) {
+	gh := fakeGitHub(t, nil)
+	gh.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+		w.Header().Set("X-RateLimit-Remaining", "42")
+		w.WriteHeader(401)
+		return true
+	}
+	r, b := syncJSON(t, newSyncEnv(t, gh, oneAddon))
+	if r.ExitCode != 3 || b.Error.Code != "auth" || !strings.Contains(b.Error.Message, "GITHUB_TOKEN") {
+		t.Errorf("exit = %d, body = %+v", r.ExitCode, b.Error)
+	}
+}
+
+func TestSyncNoPublishedReleaseExitsFour(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Draft: true}}})
+	r, b := syncJSON(t, newSyncEnv(t, gh, oneAddon))
+	if r.ExitCode != 4 || b.Error.Code != "not_found" || !strings.Contains(b.Error.Message, "acme/alpha") {
+		t.Errorf("exit = %d, body = %+v", r.ExitCode, b.Error)
+	}
+}
+
+func downloadFails(t *testing.T, status int, headers map[string]string) (clitest.Result, errBody) {
+	t.Helper()
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{
+		Tag: "v1", Assets: map[string][]byte{"alpha.zip": alphaZip(t, "x")},
+	}}})
+	gh.intercept = func(w http.ResponseWriter, r *http.Request) bool {
+		if !strings.HasPrefix(r.URL.Path, "/download/") {
+			return false
+		}
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		return true
+	}
+	return syncJSON(t, newSyncEnv(t, gh, oneAddon))
+}
+
+func TestSyncDownloadRateLimitExitsOneWithHint(t *testing.T) {
+	r, b := downloadFails(t, 429, map[string]string{"X-RateLimit-Remaining": "0"})
+	if r.ExitCode != 1 || b.Error.Code != "rate_limited" || !b.Error.Retryable ||
+		!strings.Contains(b.Error.Message, "GITHUB_TOKEN") {
+		t.Errorf("exit = %d, body = %+v", r.ExitCode, b.Error)
+	}
+}
+
+func TestSyncDownloadForbiddenExitsThree(t *testing.T) {
+	r, b := downloadFails(t, 403, nil)
+	if r.ExitCode != 3 || b.Error.Code != "auth" {
+		t.Errorf("exit = %d, body = %+v", r.ExitCode, b.Error)
+	}
+}
+
+func TestSyncDownloadServerErrorIsRetryable(t *testing.T) {
+	r, b := downloadFails(t, 503, nil)
+	if r.ExitCode != 1 || b.Error.Code != "runtime" || !b.Error.Retryable {
+		t.Errorf("exit = %d, body = %+v", r.ExitCode, b.Error)
+	}
+}

@@ -276,7 +276,7 @@ func (g *GitHub) Download(ctx context.Context, url string, w io.Writer) error {
 	case http.StatusNotFound:
 		return errs.New(errs.NotFound, "download not found: "+url, "")
 	default:
-		return &errs.Error{Kind: errs.Runtime, Message: fmt.Sprintf("download returned %s", resp.Status), Retryable: true}
+		return statusError(resp, "download "+url, false)
 	}
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		return networkError(err, "download failed")
