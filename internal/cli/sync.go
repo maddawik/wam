@@ -31,11 +31,13 @@ func bindPathFlags(root *cobra.Command) {
 
 // syncChange is one addon installed, added or removed.
 type syncChange struct {
-	// Action is "installed", "added" or "removed".
+	// Action is "installed", "added", "updated" or "removed".
 	Action string `json:"action"`
 	Addon  string `json:"addon"`
 	// Version is the manifest version, set by add.
-	Version string   `json:"version,omitempty"`
+	Version string `json:"version,omitempty"`
+	// From is the tag an update replaced.
+	From    string   `json:"from,omitempty"`
 	Tag     string   `json:"tag"`
 	Folders []string `json:"folders"`
 }
