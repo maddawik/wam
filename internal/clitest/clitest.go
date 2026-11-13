@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/maddawik/wam/internal/cli"
+	"github.com/maddawik/wam/internal/locate"
 	"github.com/spf13/cobra"
 )
 
@@ -21,6 +22,11 @@ type Opts struct {
 	StdoutTTY bool
 	StderrTTY bool
 	Version   string
+	// GOOS and Home default to the host's. Probe defaults to the real
+	// probe for GOOS.
+	GOOS  string
+	Home  string
+	Probe *locate.Probe
 	// Context defaults to context.Background(). Cancel it with an
 	// errs.Interrupt cause to simulate a signal.
 	Context context.Context
@@ -62,6 +68,9 @@ func Run(t *testing.T, o Opts) Result {
 		StdoutTTY: o.StdoutTTY,
 		StderrTTY: o.StderrTTY,
 		Vars:      env,
+		GOOS:      o.GOOS,
+		Home:      o.Home,
+		Probe:     o.Probe,
 	}, version, o.Commands...)
 	return Result{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: code, TempDir: t.TempDir()}
 }
