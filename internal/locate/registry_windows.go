@@ -14,7 +14,7 @@ func registryInstallPaths() []string {
 			continue
 		}
 		p, _, err := k.GetStringValue("InstallPath")
-		k.Close()
+		_ = k.Close()
 		if err == nil && p != "" {
 			out = append(out, p)
 		}
