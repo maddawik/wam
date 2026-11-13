@@ -65,13 +65,9 @@ func newSync() *cobra.Command {
 				return err
 			}
 			flagDir, _ := cmd.Flags().GetString("dir")
-			probe := locate.DefaultProbe(s.env.GOOS, s.env.Vars)
-			if s.env.Probe != nil {
-				probe = *s.env.Probe
-			}
 			dir, err := locate.AddOnsDir(locate.Inputs{
 				Flag: flagDir, Env: s.env.Vars["WAM_DIR"], Manifest: m.Game.Dir,
-				Flavor: m.Game.Flavor, Probe: probe,
+				Flavor: m.Game.Flavor, Probe: probeFor(s.env),
 			})
 			if err != nil {
 				return err
