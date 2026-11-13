@@ -8,6 +8,7 @@ import (
 	"io"
 	"maps"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -156,7 +157,7 @@ func runSync(ctx context.Context, src source.Source, manifestPath, addonsDir str
 			locked = &e
 		}
 		ownerOf := func(folder string) (string, bool) { return l.Owner(folder, a.Key) }
-		entry, changed, err := syncAddon(ctx, src, a, locked, addonsDir, ownerOf)
+		entry, changed, err := syncAddon(ctx, src, m.Game.Flavor, a, locked, addonsDir, ownerOf)
 		if err != nil {
 			failed = append(failed, addonError(a.Key, err))
 			continue
@@ -174,15 +175,15 @@ func runSync(ctx context.Context, src source.Source, manifestPath, addonsDir str
 
 // syncAddon brings one addon in line with the manifest. locked is its lock
 // entry, or nil. changed is false when there was nothing to do.
-func syncAddon(ctx context.Context, src source.Source, a manifest.Addon, locked *lock.Entry, addonsDir string, ownerOf install.OwnerFunc) (entry lock.Entry, changed bool, err error) {
-	if locked == nil || lockedVersion(*locked) != a.Version {
+func syncAddon(ctx context.Context, src source.Source, flavor string, a manifest.Addon, locked *lock.Entry, addonsDir string, ownerOf install.OwnerFunc) (entry lock.Entry, changed bool, err error) {
+	if locked == nil || lockedVersion(*locked) != a.Version || !assetMatches(a.Asset, locked.Asset) {
 		// New to the lock, or its pin changed: resolve it again, replacing
 		// the folders the old version put there.
 		var owned []string
 		if locked != nil {
 			owned = locked.Folders
 		}
-		entry, err = installAddon(ctx, src, a, addonsDir, owned, ownerOf)
+		entry, err = installAddon(ctx, src, flavor, a, addonsDir, owned, ownerOf)
 		return entry, err == nil, err
 	}
 	// Install exactly what the lock records, if it isn't there yet.
@@ -191,6 +192,16 @@ func syncAddon(ctx context.Context, src source.Source, a manifest.Addon, locked 
 	}
 	err = restoreAddon(ctx, src, a.Key, *locked, addonsDir, ownerOf)
 	return *locked, err == nil, err
+}
+
+// assetMatches reports whether the locked asset still satisfies the
+// manifest's glob. No glob matches anything.
+func assetMatches(glob, asset string) bool {
+	if glob == "" {
+		return true
+	}
+	ok, _ := path.Match(glob, asset)
+	return ok
 }
 
 // failure is the error for a run in which failed went wrong: nil for none,
@@ -267,8 +278,8 @@ func restoreAddon(ctx context.Context, src source.Source, key string, e lock.Ent
 
 // installAddon resolves a, installs it over any owned folders, and returns
 // its lock entry.
-func installAddon(ctx context.Context, src source.Source, a manifest.Addon, addonsDir string, owned []string, ownerOf install.OwnerFunc) (lock.Entry, error) {
-	rel, err := src.Resolve(ctx, a.ID, a.Version)
+func installAddon(ctx context.Context, src source.Source, flavor string, a manifest.Addon, addonsDir string, owned []string, ownerOf install.OwnerFunc) (lock.Entry, error) {
+	rel, err := src.Resolve(ctx, a.ID, source.Spec{Version: a.Version, Asset: a.Asset, Flavor: flavor})
 	if err != nil {
 		return lock.Entry{}, err
 	}
