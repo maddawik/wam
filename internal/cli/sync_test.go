@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/maddawik/wam/internal/clitest"
 	"github.com/maddawik/wam/internal/errs"
@@ -47,11 +48,62 @@ type fakeServer struct {
 	// intercept, if set, sees every request first and answers it by
 	// returning true.
 	intercept func(http.ResponseWriter, *http.Request) bool
+
+	// inFlight and peak count requests being served at once.
+	flight         sync.Mutex
+	inFlight, peak int
+	flightChanged  *sync.Cond
+}
+
+// enter and leave bracket a request in the in-flight count.
+func (f *fakeServer) enter() {
+	f.flight.Lock()
+	defer f.flight.Unlock()
+	f.inFlight++
+	f.peak = max(f.peak, f.inFlight)
+	f.flightChanged.Broadcast()
+}
+
+func (f *fakeServer) leave() {
+	f.flight.Lock()
+	defer f.flight.Unlock()
+	f.inFlight--
+	f.flightChanged.Broadcast()
+}
+
+// waitInFlight blocks until n requests have been in flight at once, or timeout.
+func (f *fakeServer) waitInFlight(n int, timeout time.Duration) {
+	stop := time.AfterFunc(timeout, func() {
+		f.flight.Lock()
+		defer f.flight.Unlock()
+		f.flightChanged.Broadcast()
+	})
+	defer stop.Stop()
+	deadline := time.Now().Add(timeout)
+	f.flight.Lock()
+	defer f.flight.Unlock()
+	for f.peak < n && time.Now().Before(deadline) {
+		f.flightChanged.Wait()
+	}
+}
+
+// peakInFlight is the most requests served at once so far.
+func (f *fakeServer) peakInFlight() int {
+	f.flight.Lock()
+	defer f.flight.Unlock()
+	return f.peak
+}
+
+func (f *fakeServer) resetPeak() {
+	f.flight.Lock()
+	defer f.flight.Unlock()
+	f.peak = f.inFlight
 }
 
 func fakeGitHub(t *testing.T, repos map[string][]fakeRelease) *fakeServer {
 	t.Helper()
 	f := &fakeServer{repos: repos, releases: map[string]int{}}
+	f.flightChanged = sync.NewCond(&f.flight)
 	if f.repos == nil {
 		f.repos = map[string][]fakeRelease{}
 	}
@@ -86,6 +138,8 @@ func (f *fakeServer) json(w http.ResponseWriter, repo string, r fakeRelease) map
 }
 
 func (f *fakeServer) serve(w http.ResponseWriter, req *http.Request) {
+	f.enter()
+	defer f.leave()
 	if f.intercept != nil && f.intercept(w, req) {
 		return
 	}
@@ -856,13 +910,20 @@ func TestSyncInterruptedPartWayLocksWhatItInstalled(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
-	gh.onDownload = func(req *http.Request) {
-		if strings.Contains(req.URL.Path, "acme/beta") {
-			cancel(errs.Interrupt(syscall.SIGTERM))
-			<-req.Context().Done()
-		}
-	}
 	e := newSyncEnv(t, gh, oneAddon+`"github:acme/beta" = "latest"`+"\n")
+	gh.onDownload = func(req *http.Request) {
+		if !strings.Contains(req.URL.Path, "acme/beta") {
+			return
+		}
+		// Downloads run at once, so wait for alpha to be locked first.
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+			if l, err := lock.Load(e.lock); err == nil && len(l.Addons) > 0 {
+				break
+			}
+		}
+		cancel(errs.Interrupt(syscall.SIGTERM))
+		<-req.Context().Done()
+	}
 
 	r := clitest.Run(t, clitest.Opts{Args: []string{"sync", "-f", e.manifest, "--dir", e.addons}, Env: e.vars, Context: ctx})
 	if r.ExitCode != 143 {

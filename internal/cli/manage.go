@@ -128,10 +128,16 @@ func newAdd() *cobra.Command {
 			}
 			a := manifest.Addon{Key: key, Source: "github", ID: id, Version: version}
 			ownerOf := func(folder string) (string, bool) { return l.Owner(folder, key) }
+			prog := newProgress(s, 1)
+			prog.start(key)
 			entry, err := installAddon(cmd.Context(), p.gh, p.m.Game.Flavor, a, dir, nil, ownerOf)
 			if err != nil {
+				prog.finish(key, "failed", "")
+				_ = prog.close()
 				return addonError(key, err)
 			}
+			prog.finish(key, "installed "+entry.Tag, "")
+			_ = prog.close()
 			l.Addons[key] = entry
 			if err := lock.Save(lockFile, l); err != nil {
 				return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot write lock %s", lockFile), "")
