@@ -1047,8 +1047,33 @@ func TestSyncReleaseJSONWithoutMatchingFlavorExits5(t *testing.T) {
 	}}}})
 	e := newSyncEnv(t, gh, entryWith(`"latest"`, "forever"))
 	r := e.sync(t)
-	if r.ExitCode != 5 || !strings.Contains(r.Stderr, "Alpha-a.zip") || !strings.Contains(r.Stderr, "Alpha-b.zip") {
-		t.Errorf("exit = %d, stderr = %q", r.ExitCode, r.Stderr)
+	if r.ExitCode != 5 {
+		t.Fatalf("exit = %d, want 5; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	if want := `github:acme/alpha v1 doesn't support flavor "forever" (supports: classic, mainline)`; !strings.Contains(r.Stderr, want) {
+		t.Errorf("stderr %q lacks %q", r.Stderr, want)
+	}
+	// Setting asset would skip the flavor check, so the error must not
+	// suggest it.
+	if strings.Contains(r.Stderr, "asset") {
+		t.Errorf("stderr %q suggests setting asset", r.Stderr)
+	}
+}
+
+func TestSyncReleaseJSONWithSeveralZipsForFlavorSuggestsAsset(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{
+		"Alpha-a.zip": zipMarker(t, "a"), "Alpha-b.zip": zipMarker(t, "b"),
+		"release.json": releaseJSON(t, map[string][]string{"Alpha-a.zip": {"mainline"}, "Alpha-b.zip": {"mainline"}}),
+	}}}})
+	e := newSyncEnv(t, gh, entryWith(`"latest"`, "mainline"))
+	r := e.sync(t)
+	if r.ExitCode != 5 {
+		t.Fatalf("exit = %d, want 5; stderr = %q", r.ExitCode, r.Stderr)
+	}
+	for _, want := range []string{"Alpha-a.zip", "Alpha-b.zip", "set asset"} {
+		if !strings.Contains(r.Stderr, want) {
+			t.Errorf("stderr %q lacks %q", r.Stderr, want)
+		}
 	}
 }
 

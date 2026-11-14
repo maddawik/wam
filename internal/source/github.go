@@ -202,6 +202,8 @@ func (g *GitHub) pickZip(ctx context.Context, id string, r ghRelease, spec Spec)
 	}
 
 	candidates := zips
+	// flavors are the flavors release.json lists for any zip.
+	var flavors []string
 	switch {
 	case spec.Asset != "":
 		candidates = filter(zips, func(z Release) bool { ok, _ := path.Match(spec.Asset, z.Asset); return ok })
@@ -217,6 +219,7 @@ func (g *GitHub) pickZip(ctx context.Context, id string, r ghRelease, spec Spec)
 		named := map[string]bool{}
 		for _, e := range rj.Releases {
 			for _, m := range e.Metadata {
+				flavors = append(flavors, m.Flavor)
 				if m.Flavor == spec.Flavor {
 					named[e.Filename] = true
 				}
@@ -226,6 +229,14 @@ func (g *GitHub) pickZip(ctx context.Context, id string, r ghRelease, spec Spec)
 	}
 	if len(candidates) == 1 {
 		return candidates[0], nil
+	}
+
+	// The release isn't built for this flavor. Don't point at asset: a glob
+	// skips the flavor check and would install another flavor's build.
+	if len(candidates) == 0 && len(flavors) > 0 {
+		slices.Sort(flavors)
+		return Release{}, errs.New(errs.Conflict,
+			fmt.Sprintf("%s doesn't support flavor %q (supports: %s)", what, spec.Flavor, strings.Join(slices.Compact(flavors), ", ")), "")
 	}
 
 	// Zero or several matches: never guess. Show what the release has.
