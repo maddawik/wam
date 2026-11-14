@@ -4,6 +4,7 @@ package clitest
 import (
 	"bytes"
 	"context"
+	"io"
 	"strings"
 	"testing"
 
@@ -33,6 +34,9 @@ type Opts struct {
 	// Commands are added to the root, to inject behaviour no real command
 	// has yet (a given error, a panic, a prompt).
 	Commands []*cobra.Command
+	// Stdout, if set, also receives stdout as it is written, for tests that
+	// watch output during the run. It must be safe for concurrent reads.
+	Stdout io.Writer
 }
 
 // Result is what a run produced.
@@ -60,9 +64,13 @@ func Run(t *testing.T, o Opts) Result {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	var out io.Writer = &stdout
+	if o.Stdout != nil {
+		out = io.MultiWriter(&stdout, o.Stdout)
+	}
 	code := cli.Execute(ctx, o.Args, cli.Env{
 		Stdin:     strings.NewReader(o.Stdin),
-		Stdout:    &stdout,
+		Stdout:    out,
 		Stderr:    &stderr,
 		StdinTTY:  o.StdinTTY,
 		StdoutTTY: o.StdoutTTY,

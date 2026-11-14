@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 
 	"github.com/maddawik/wam/internal/errs"
-	"github.com/maddawik/wam/internal/install"
 	"github.com/maddawik/wam/internal/lock"
 	"github.com/maddawik/wam/internal/manifest"
 	"github.com/maddawik/wam/internal/source"
@@ -54,113 +52,66 @@ func newUpdate() *cobra.Command {
 				return err
 			}
 			changes, err := runUpdate(cmd.Context(), s, p, targets, dir)
-			if len(changes) > 0 || err == nil {
-				if eerr := s.Emit(changes, func(w io.Writer) error {
-					for _, c := range changes {
-						msg := fmt.Sprintf("updated %s %s", c.Addon, c.Tag)
-						if c.From != "" && c.From != c.Tag {
-							msg = fmt.Sprintf("updated %s %s -> %s", c.Addon, c.From, c.Tag)
-						}
-						if _, err := fmt.Fprintln(w, msg); err != nil {
-							return err
-						}
-					}
-					return nil
-				}); err == nil {
-					err = eerr
-				}
-			}
-			return err
+			return emitChanges(s, changes, err)
 		},
 	}
 }
 
-// runUpdate re-resolves targets, installs what changed and saves the lock
-// after each. A failing addon is skipped and the rest carry on.
-func runUpdate(ctx context.Context, s *IO, p *project, targets []manifest.Addon, addonsDir string) (changes []syncChange, err error) {
-	changes = []syncChange{}
+// runUpdate re-resolves targets and installs what changed, as
+// addonRun.downloadAll does.
+func runUpdate(ctx context.Context, s *IO, p *project, targets []manifest.Addon, addonsDir string) ([]syncChange, error) {
 	if len(targets) == 0 {
-		return changes, nil
+		return []syncChange{}, nil
 	}
-	lockFile := lockPath(p.file)
-	l, err := lock.Load(lockFile)
+	r, err := startRun(ctx, p.file, addonsDir)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(addonsDir, 0o755); err != nil {
-		return nil, errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot create %s", addonsDir), "")
+	jobs := make([]downloadJob, len(targets))
+	for i, a := range targets {
+		jobs[i] = updateJob(r, p, a)
 	}
-	if err := install.Recover(addonsDir); err != nil {
-		return nil, err
-	}
-	var failed []*errs.Error
-	defer func() {
-		if err == nil {
-			err = failure(failed, len(changes) > 0)
-		}
-	}()
-	for _, a := range targets {
-		if err := ctx.Err(); err != nil {
-			return changes, err
-		}
-		if a.Source != "github" {
-			failed = append(failed, addonError(a.Key, errs.New(errs.Usage, fmt.Sprintf("source %q is not supported; only github", a.Source), "wam update --help")))
-			continue
-		}
-		var locked *lock.Entry
-		if e, ok := l.Addons[a.Key]; ok {
-			locked = &e
-		}
-		ownerOf := func(folder string) (string, bool) { return l.Owner(folder, a.Key) }
-		entry, changed, err := updateAddon(ctx, p.gh, p.m.Game.Flavor, a, locked, addonsDir, ownerOf)
-		if err != nil {
-			failed = append(failed, addonError(a.Key, err))
-			continue
-		}
-		if !changed {
-			if isPinned(a) {
-				s.Infof("%s is pinned to %s; edit its version in %s to move it", a.Key, a.Version, p.file)
-			}
-			continue
-		}
-		c := syncChange{Action: "updated", Addon: a.Key, Tag: entry.Tag, Folders: entry.Folders}
-		if locked != nil {
-			c.From = locked.Tag
-		}
-		l.Addons[a.Key] = entry
-		changes = append(changes, c)
-		if err := lock.Save(lockFile, l); err != nil {
-			return changes, errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot write lock %s", lockFile), "")
-		}
-	}
-	return changes, nil
+	r.prog = newProgress(s, len(jobs))
+	return r.finish(func() error { return r.downloadAll(jobs) })
 }
 
-// updateAddon resolves a again, whatever the lock says, and installs the
+// updateJob resolves a again, whatever the lock says, and installs the
 // result unless it is exactly what is already locked and installed.
-func updateAddon(ctx context.Context, src source.Source, flavor string, a manifest.Addon, locked *lock.Entry, addonsDir string, ownerOf install.OwnerFunc) (entry lock.Entry, changed bool, err error) {
-	rel, err := src.Resolve(ctx, a.ID, source.Spec{Version: a.Version, Asset: a.Asset, Flavor: flavor})
-	if err != nil {
-		return lock.Entry{}, false, err
+func updateJob(r *addonRun, p *project, a manifest.Addon) downloadJob {
+	if a.Source != "github" {
+		return unsupportedJob(a, "wam update --help")
 	}
-	zipPath, sum, cleanup, err := fetch(ctx, src, rel.URL, addonsDir)
-	if err != nil {
-		return lock.Entry{}, false, err
+	j := downloadJob{key: a.Key}
+	flavor := p.m.Game.Flavor
+	j.fetch = func(ctx context.Context) (download, error) {
+		return fetchRelease(ctx, p.gh, flavor, a, r.addonsDir)
 	}
-	defer cleanup()
-	if locked != nil && locked.Tag == rel.Tag && locked.SHA256 == sum && installed(addonsDir, locked.Folders) {
-		return *locked, false, nil
+	j.install = func(d download) (*syncChange, error) {
+		locked, ok := r.l.Addons[a.Key]
+		if ok && locked.Tag == d.rel.Tag && locked.SHA256 == d.sum && installed(r.addonsDir, locked.Folders) {
+			return nil, nil
+		}
+		var owned []string
+		if ok {
+			owned = locked.Folders
+		}
+		entry, err := installRelease(r.ctx, a, d, r.addonsDir, owned, r.ownerOf(a.Key))
+		if err != nil {
+			return nil, err
+		}
+		r.l.Addons[a.Key] = entry
+		c := &syncChange{Action: "updated", Addon: a.Key, Tag: entry.Tag, Folders: entry.Folders}
+		if ok {
+			c.From = locked.Tag
+		}
+		return c, nil
 	}
-	var owned []string
-	if locked != nil {
-		owned = locked.Folders
+	if isPinned(a) {
+		j.unchanged = func() {
+			r.prog.infof("%s is pinned to %s; edit its version in %s to move it", a.Key, a.Version, p.file)
+		}
 	}
-	folders, err := install.Zip(ctx, zipPath, addonsDir, owned, ownerOf)
-	if err != nil {
-		return lock.Entry{}, false, err
-	}
-	entry, err = newLockEntry(a, rel, sum, addonsDir, folders)
-	return entry, err == nil, err
+	return j
 }
 
 // outdatedAddon is an addon whose newest release isn't the locked one.

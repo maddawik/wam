@@ -42,6 +42,24 @@ type syncChange struct {
 	Folders []string `json:"folders"`
 }
 
+// summary is what happened, without the addon: "installed v2" or
+// "updated v1 -> v2".
+func (c syncChange) summary() string {
+	if c.From != "" && c.From != c.Tag {
+		return fmt.Sprintf("%s %s -> %s", c.Action, c.From, c.Tag)
+	}
+	return c.Action + " " + c.Tag
+}
+
+// line is c's stdout line from sync and update: "installed <addon> v2" or
+// "updated <addon> v1 -> v2".
+func (c syncChange) line() string {
+	if c.From != "" && c.From != c.Tag {
+		return fmt.Sprintf("%s %s %s -> %s", c.Action, c.Addon, c.From, c.Tag)
+	}
+	return fmt.Sprintf("%s %s %s", c.Action, c.Addon, c.Tag)
+}
+
 func newSync() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "sync",
@@ -51,7 +69,8 @@ func newSync() *cobra.Command {
 			"is \"latest\" or an exact release tag, matched as written. Addons the\n" +
 			"lock already has are installed as locked and never moved to a newer\n" +
 			"release; only new entries or changed versions are resolved. Every\n" +
-			"download is checked against the lock's SHA-256." + previewHelp,
+			"download is checked against the lock's SHA-256. Up to 4 addons\n" +
+			"download at once; each is reported as it finishes." + previewHelp,
 		Example: "  wam sync\n  wam sync -f wam.toml --dir \"/Applications/World of Warcraft/_retail_/Interface/AddOns\"\n" +
 			"  wam sync -f wam.toml --dir ./AddOns --json",
 		Args: cobra.NoArgs,
@@ -73,25 +92,24 @@ func newSync() *cobra.Command {
 				}
 				return err
 			}
-			changes, err := runSync(cmd.Context(), gh, m, file, dir)
-			// Report what was installed even when a later addon failed.
-			if len(changes) > 0 || err == nil {
-				if eerr := s.Emit(changes, func(w io.Writer) error {
-					for _, c := range changes {
-						if _, err := fmt.Fprintf(w, "%s %s %s\n", c.Action, c.Addon, c.Tag); err != nil {
-							return err
-						}
-					}
-					return nil
-				}); err == nil {
-					err = eerr
-				}
-			}
-			return err
+			changes, err := runSync(cmd.Context(), s, gh, m, file, dir)
+			return emitChanges(s, changes, err)
 		},
 	}
 	bindPreview(c)
 	return c
+}
+
+// emitChanges finishes a command whose text output went out as each addon
+// finished: under --json it writes every change now. They are reported even
+// when a later addon failed.
+func emitChanges(s *IO, changes []syncChange, err error) error {
+	if s.JSON() && (len(changes) > 0 || err == nil) {
+		if jerr := writeJSON(s.Out, changes); err == nil {
+			err = jerr
+		}
+	}
+	return err
 }
 
 // manifestPath is the manifest to use: -f, then WAM_FILE, then wam.toml in
@@ -116,108 +134,94 @@ func lockPath(manifestPath string) string {
 }
 
 // runSync removes the folders of addons the manifest dropped, then installs
-// every manifest addon the lock doesn't have yet. An addon that fails is
-// skipped and the rest carry on. The lock is saved after each change, so a
-// run killed part way still records what it put in the AddOns folder.
-// One failure is returned as is, several as one runtime error naming each.
-func runSync(ctx context.Context, src source.Source, m *manifest.Manifest, manifestPath, addonsDir string) (changes []syncChange, err error) {
-	lockFile := lockPath(manifestPath)
-	l, err := lock.Load(lockFile)
+// every manifest addon the lock doesn't have yet, as addonRun.downloadAll
+// does. One failure is returned as is, several as one runtime error naming
+// each.
+func runSync(ctx context.Context, s *IO, src source.Source, m *manifest.Manifest, manifestPath, addonsDir string) ([]syncChange, error) {
+	r, err := startRun(ctx, manifestPath, addonsDir)
 	if err != nil {
 		return nil, err
-	}
-	if err := os.MkdirAll(addonsDir, 0o755); err != nil {
-		return nil, errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot create %s", addonsDir), "")
-	}
-	// Undo whatever a crashed run left half done before changing anything.
-	if err := install.Recover(addonsDir); err != nil {
-		return nil, err
-	}
-	changes = []syncChange{}
-	var failed []*errs.Error
-	defer func() {
-		if err == nil {
-			err = failure(failed, len(changes) > 0)
-		}
-	}()
-	record := func(c syncChange) error {
-		changes = append(changes, c)
-		if err := lock.Save(lockFile, l); err != nil {
-			return errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot write lock %s", lockFile), "")
-		}
-		return nil
 	}
 
 	wanted := map[string]bool{}
 	for _, a := range m.Addons {
 		wanted[a.Key] = true
 	}
-	for _, key := range slices.Sorted(maps.Keys(l.Addons)) {
-		if wanted[key] {
-			continue
-		}
-		e := l.Addons[key]
-		if ctx.Err() != nil {
-			return changes, ctx.Err()
-		}
-		if err := install.Remove(addonsDir, e.Folders); err != nil {
-			failed = append(failed, addonError(key, err))
-			continue
-		}
-		delete(l.Addons, key)
-		if err := record(syncChange{Action: "removed", Addon: key, Tag: e.Tag, Folders: e.Folders}); err != nil {
-			return changes, err
+	var dropped []string
+	for _, key := range slices.Sorted(maps.Keys(r.l.Addons)) {
+		if !wanted[key] {
+			dropped = append(dropped, key)
 		}
 	}
-
+	var jobs []downloadJob
 	for _, a := range m.Addons {
-		if ctx.Err() != nil {
-			return changes, ctx.Err()
-		}
-		if a.Source != "github" {
-			failed = append(failed, addonError(a.Key, errs.New(errs.Usage, fmt.Sprintf("source %q is not supported; only github", a.Source), "wam sync --help")))
-			continue
-		}
-		var locked *lock.Entry
-		if e, ok := l.Addons[a.Key]; ok {
-			locked = &e
-		}
-		ownerOf := func(folder string) (string, bool) { return l.Owner(folder, a.Key) }
-		entry, changed, err := syncAddon(ctx, src, m.Game.Flavor, a, locked, addonsDir, ownerOf)
-		if err != nil {
-			failed = append(failed, addonError(a.Key, err))
-			continue
-		}
-		if !changed {
-			continue
-		}
-		l.Addons[a.Key] = entry
-		if err := record(syncChange{Action: "installed", Addon: a.Key, Tag: entry.Tag, Folders: entry.Folders}); err != nil {
-			return changes, err
+		if j, ok := syncJob(r, src, m.Game.Flavor, a); ok {
+			jobs = append(jobs, j)
 		}
 	}
-	return changes, nil
+	r.prog = newProgress(s, len(dropped)+len(jobs))
+
+	return r.finish(func() error {
+		for _, key := range dropped {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			e := r.l.Addons[key]
+			if err := install.Remove(addonsDir, e.Folders); err != nil {
+				r.failed(key, err)
+				continue
+			}
+			delete(r.l.Addons, key)
+			if err := r.changed(syncChange{Action: "removed", Addon: key, Tag: e.Tag, Folders: e.Folders}); err != nil {
+				return err
+			}
+		}
+		return r.downloadAll(jobs)
+	})
 }
 
-// syncAddon brings one addon in line with the manifest. locked is its lock
-// entry, or nil. changed is false when there was nothing to do.
-func syncAddon(ctx context.Context, src source.Source, flavor string, a manifest.Addon, locked *lock.Entry, addonsDir string, ownerOf install.OwnerFunc) (entry lock.Entry, changed bool, err error) {
-	if locked == nil || lockedVersion(*locked) != a.Version || !assetMatches(a.Asset, locked.Asset) {
-		// New to the lock, or its pin changed: resolve it again, replacing
-		// the folders the old version put there.
-		var owned []string
-		if locked != nil {
-			owned = locked.Folders
+// syncJob is the download that brings a in line with the manifest, if it
+// needs one.
+func syncJob(r *addonRun, src source.Source, flavor string, a manifest.Addon) (downloadJob, bool) {
+	if a.Source != "github" {
+		return unsupportedJob(a, "wam sync --help"), true
+	}
+	j := downloadJob{key: a.Key}
+	locked, ok := r.l.Addons[a.Key]
+	if ok && lockedVersion(locked) == a.Version && assetMatches(a.Asset, locked.Asset) {
+		if installed(r.addonsDir, locked.Folders) {
+			return j, false
 		}
-		entry, err = installAddon(ctx, src, flavor, a, addonsDir, owned, ownerOf)
-		return entry, err == nil, err
+		// Install exactly what the lock records.
+		j.fetch = func(ctx context.Context) (download, error) {
+			return fetchLocked(ctx, src, a.Key, locked, r.addonsDir)
+		}
+		j.install = func(d download) (*syncChange, error) {
+			if _, err := install.Zip(r.ctx, d.zip, r.addonsDir, locked.Folders, r.ownerOf(a.Key)); err != nil {
+				return nil, err
+			}
+			return &syncChange{Action: "installed", Addon: a.Key, Tag: locked.Tag, Folders: locked.Folders}, nil
+		}
+		return j, true
 	}
-	// Install exactly what the lock records, if it isn't there yet.
-	if installed(addonsDir, locked.Folders) {
-		return *locked, false, nil
+	// New to the lock, or its pin changed: resolve it again, replacing the
+	// folders the old version put there.
+	var owned []string
+	if ok {
+		owned = locked.Folders
 	}
-	err = restoreAddon(ctx, src, a.Key, *locked, addonsDir, ownerOf)
-	return *locked, err == nil, err
+	j.fetch = func(ctx context.Context) (download, error) {
+		return fetchRelease(ctx, src, flavor, a, r.addonsDir)
+	}
+	j.install = func(d download) (*syncChange, error) {
+		entry, err := installRelease(r.ctx, a, d, r.addonsDir, owned, r.ownerOf(a.Key))
+		if err != nil {
+			return nil, err
+		}
+		r.l.Addons[a.Key] = entry
+		return &syncChange{Action: "installed", Addon: a.Key, Tag: entry.Tag, Folders: entry.Folders}, nil
+	}
+	return j, true
 }
 
 // assetMatches reports whether the locked asset still satisfies the
@@ -285,40 +289,63 @@ func installed(addonsDir string, folders []string) bool {
 	return true
 }
 
-// restoreAddon installs the release the lock records, without asking the host
-// what is newest. The download must match the lock's hash.
-func restoreAddon(ctx context.Context, src source.Source, key string, e lock.Entry, addonsDir string, ownerOf install.OwnerFunc) error {
+// download is a release fetched to a temp file in the AddOns folder. Call
+// cleanup to delete the file.
+type download struct {
+	rel     source.Release
+	zip     string
+	sum     string
+	cleanup func()
+}
+
+// fetchRelease resolves a and downloads the release it names.
+func fetchRelease(ctx context.Context, src source.Source, flavor string, a manifest.Addon, addonsDir string) (download, error) {
+	rel, err := src.Resolve(ctx, a.ID, source.Spec{Version: a.Version, Asset: a.Asset, Flavor: flavor})
+	if err != nil {
+		return download{}, err
+	}
+	zipPath, sum, cleanup, err := fetch(ctx, src, rel.URL, addonsDir)
+	if err != nil {
+		return download{}, err
+	}
+	return download{rel: rel, zip: zipPath, sum: sum, cleanup: cleanup}, nil
+}
+
+// fetchLocked downloads the release the lock records, without asking the
+// host what is newest. The download must match the lock's hash.
+func fetchLocked(ctx context.Context, src source.Source, key string, e lock.Entry, addonsDir string) (download, error) {
 	zipPath, sum, cleanup, err := fetch(ctx, src, e.URL, addonsDir)
 	if err != nil {
-		return err
+		return download{}, err
 	}
-	defer cleanup()
 	if sum != e.SHA256 {
-		return errs.New(errs.Conflict,
+		cleanup()
+		return download{}, errs.New(errs.Conflict,
 			fmt.Sprintf("%s does not match the lock's SHA-256; the asset changed since it was locked", e.Tag),
 			"wam update "+key)
 	}
-	_, err = install.Zip(ctx, zipPath, addonsDir, e.Folders, ownerOf)
-	return err
+	return download{rel: source.Release{Tag: e.Tag, Asset: e.Asset, URL: e.URL}, zip: zipPath, sum: sum, cleanup: cleanup}, nil
+}
+
+// installRelease installs d over any owned folders and returns a's lock
+// entry for it.
+func installRelease(ctx context.Context, a manifest.Addon, d download, addonsDir string, owned []string, ownerOf install.OwnerFunc) (lock.Entry, error) {
+	folders, err := install.Zip(ctx, d.zip, addonsDir, owned, ownerOf)
+	if err != nil {
+		return lock.Entry{}, err
+	}
+	return newLockEntry(a, d.rel, d.sum, addonsDir, folders)
 }
 
 // installAddon resolves a, installs it over any owned folders, and returns
 // its lock entry.
 func installAddon(ctx context.Context, src source.Source, flavor string, a manifest.Addon, addonsDir string, owned []string, ownerOf install.OwnerFunc) (lock.Entry, error) {
-	rel, err := src.Resolve(ctx, a.ID, source.Spec{Version: a.Version, Asset: a.Asset, Flavor: flavor})
+	d, err := fetchRelease(ctx, src, flavor, a, addonsDir)
 	if err != nil {
 		return lock.Entry{}, err
 	}
-	zipPath, sum, cleanup, err := fetch(ctx, src, rel.URL, addonsDir)
-	if err != nil {
-		return lock.Entry{}, err
-	}
-	defer cleanup()
-	folders, err := install.Zip(ctx, zipPath, addonsDir, owned, ownerOf)
-	if err != nil {
-		return lock.Entry{}, err
-	}
-	return newLockEntry(a, rel, sum, addonsDir, folders)
+	defer d.cleanup()
+	return installRelease(ctx, a, d, addonsDir, owned, ownerOf)
 }
 
 // newLockEntry is the lock entry for a installed from rel, whose download
