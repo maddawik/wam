@@ -107,17 +107,16 @@ func unsupportedJob(a manifest.Addon, run string) downloadJob {
 	return downloadJob{key: a.Key, fetch: func(context.Context) (download, error) { return download{}, err }}
 }
 
-// downloadAll runs jobs, fetching up to downloadLimit at once. Each is
-// installed as its download finishes, one at a time, and reported then. A
-// job that fails is recorded and the rest carry on. The lock is saved after
-// each change, so a run killed part way still records what it put in the
-// AddOns folder; if saving fails, the run stops with that error. Changes and
-// failures are recorded in job order, however the downloads finished.
+// downloadAll runs jobs, fetching up to downloadLimit at once. They are
+// installed one at a time in job order, each as soon as its download and
+// every earlier job are done, so which addon gets a folder two of them claim
+// never depends on download speed. A job that fails is recorded and the rest
+// carry on. The lock is saved after each change, so a run killed part way
+// still records what it put in the AddOns folder; if saving fails, the run
+// stops with that error.
 func (r *addonRun) downloadAll(jobs []downloadJob) error {
 	ctx, cancel := context.WithCancel(r.ctx)
 	defer cancel()
-	changes := make([]*syncChange, len(jobs))
-	fails := make([]*errs.Error, len(jobs))
 	var stop error
 	fanOut(len(jobs), func(i int) func() {
 		j := jobs[i]
@@ -140,31 +139,20 @@ func (r *addonRun) downloadAll(jobs []downloadJob) error {
 			}
 			switch {
 			case err != nil:
-				fails[i] = addonError(j.key, err)
-				r.prog.finish(j.key, "failed", "")
+				r.failed(j.key, err)
 			case c == nil:
 				r.prog.finish(j.key, "up to date", "")
 				if j.unchanged != nil {
 					j.unchanged()
 				}
 			default:
-				changes[i] = c
-				r.prog.finish(j.key, c.summary(), c.line())
-				if err := r.save(); err != nil {
+				if err := r.changed(*c); err != nil {
 					stop = err
 					cancel()
 				}
 			}
 		}
 	})
-	for i := range jobs {
-		if changes[i] != nil {
-			r.changes = append(r.changes, *changes[i])
-		}
-		if fails[i] != nil {
-			r.fails = append(r.fails, fails[i])
-		}
-	}
 	if stop != nil {
 		return stop
 	}
@@ -172,12 +160,16 @@ func (r *addonRun) downloadAll(jobs []downloadJob) error {
 }
 
 // fanOut calls work(i) for each i in [0, n), at most downloadLimit at once,
-// and calls the func each returns on the calling goroutine as soon as that
-// work is done, so whatever the returned funcs change needs no locking.
-// work must not touch that state. A panic in work is raised again on the
-// calling goroutine.
+// and calls the funcs they return on the calling goroutine in index order,
+// each as soon as its work and every earlier one are done. Whatever the
+// returned funcs change needs no locking; work must not touch it. A panic in
+// work is raised again on the calling goroutine.
 func fanOut(n int, work func(i int) func()) {
-	results := make(chan func())
+	type result struct {
+		i    int
+		done func()
+	}
+	results := make(chan result)
 	slots := make(chan struct{}, downloadLimit)
 	go func() {
 		var wg sync.WaitGroup
@@ -194,7 +186,7 @@ func fanOut(n int, work func(i int) func()) {
 					done = work(i)
 				}()
 				<-slots
-				results <- done
+				results <- result{i, done}
 			})
 		}
 		wg.Wait()
@@ -205,7 +197,14 @@ func fanOut(n int, work func(i int) func()) {
 		for range results {
 		}
 	}()
-	for done := range results {
-		done()
+	waiting := map[int]func(){}
+	next := 0
+	for res := range results {
+		waiting[res.i] = res.done
+		for done, ok := waiting[next]; ok; done, ok = waiting[next] {
+			delete(waiting, next)
+			next++
+			done()
+		}
 	}
 }

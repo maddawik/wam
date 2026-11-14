@@ -108,6 +108,31 @@ func TestSyncFailingDownloadDoesNotStopTheOthers(t *testing.T) {
 	assertNoTempFiles(t, e.addons)
 }
 
+func TestSyncFolderClaimedByTwoNewAddonsGoesToTheFirstInTheManifest(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{
+		"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{"a.zip": makeZip(t, map[string]string{"Shared/a.lua": "alpha"})}}},
+		"acme/beta":  {{Tag: "v1", Assets: map[string][]byte{"b.zip": makeZip(t, map[string]string{"Shared/b.lua": "beta"})}}},
+	})
+	// beta finishes downloading well before alpha.
+	gh.onDownload = func(req *http.Request) {
+		if strings.Contains(req.URL.Path, "acme/alpha") {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	e := newSyncEnv(t, gh, twoAddons(alphaLine, betaLine))
+
+	r := e.sync(t)
+	if r.ExitCode != 1 || !strings.Contains(r.Stderr, "github:acme/beta") {
+		t.Fatalf("exit = %d, stderr = %q; want 1 with beta refused", r.ExitCode, r.Stderr)
+	}
+	if got := read(t, filepath.Join(e.addons, "Shared", "a.lua")); got != "alpha" {
+		t.Errorf("Shared/a.lua = %q, want alpha's", got)
+	}
+	if r.Stdout != "installed github:acme/alpha v1\n" {
+		t.Errorf("stdout = %q, want only alpha installed", r.Stdout)
+	}
+}
+
 func TestSyncPrintsEachAddonAsItFinishes(t *testing.T) {
 	repos, manifest := manyAddons(t, 2)
 	gh := fakeGitHub(t, repos)

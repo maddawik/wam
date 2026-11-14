@@ -69,8 +69,8 @@ func newSync() *cobra.Command {
 			"is \"latest\" or an exact release tag, matched as written. Addons the\n" +
 			"lock already has are installed as locked and never moved to a newer\n" +
 			"release; only new entries or changed versions are resolved. Every\n" +
-			"download is checked against the lock's SHA-256. Up to 4 addons\n" +
-			"download at once; each is reported as it finishes." + previewHelp,
+			"download is checked against the lock's SHA-256. Up to 4 addons download\n" +
+			"at once; each installs and is reported in manifest order." + previewHelp,
 		Example: "  wam sync\n  wam sync -f wam.toml --dir \"/Applications/World of Warcraft/_retail_/Interface/AddOns\"\n" +
 			"  wam sync -f wam.toml --dir ./AddOns --json",
 		Args: cobra.NoArgs,
