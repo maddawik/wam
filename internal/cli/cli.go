@@ -105,7 +105,7 @@ func newRoot(inv *invocation) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "wam",
 		Short:         "wam command-line tool",
-		Example:       "  wam version\n  wam init\n  wam add github:owner/repo\n  wam sync\n  wam update\n  wam outdated\n  wam completion zsh",
+		Example:       "  wam version\n  wam init\n  wam add github:owner/repo\n  wam sync\n  wam update\n  wam outdated\n  wam list\n  wam completion zsh",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          unknownCommand,
@@ -119,7 +119,7 @@ func newRoot(inv *invocation) *cobra.Command {
 	s.bindFlags(root)
 	bindPathFlags(root)
 	installHelp(root, s)
-	root.AddCommand(newInit(), newSync(), newAdd(), newRemove(), newUpdate(), newOutdated(), newVersion(inv.version))
+	root.AddCommand(newInit(), newSync(), newAdd(), newRemove(), newUpdate(), newOutdated(), newList(), newVersion(inv.version))
 	addCompletion(root)
 	root.SetIn(s.In)
 	root.SetOut(s.Out)

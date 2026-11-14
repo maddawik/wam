@@ -159,10 +159,8 @@ func updateAddon(ctx context.Context, src source.Source, flavor string, a manife
 	if err != nil {
 		return lock.Entry{}, false, err
 	}
-	return lock.Entry{
-		Source: a.Source, Repo: a.ID, Version: a.Version, Tag: rel.Tag, Asset: rel.Asset, URL: rel.URL,
-		SHA256: sum, Folders: folders,
-	}, true, nil
+	entry, err = newLockEntry(a, rel, sum, addonsDir, folders)
+	return entry, err == nil, err
 }
 
 // outdatedAddon is an addon whose newest release isn't the locked one.
