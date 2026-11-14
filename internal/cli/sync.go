@@ -318,6 +318,12 @@ func installAddon(ctx context.Context, src source.Source, flavor string, a manif
 	if err != nil {
 		return lock.Entry{}, err
 	}
+	return newLockEntry(a, rel, sum, addonsDir, folders)
+}
+
+// newLockEntry is the lock entry for a installed from rel, whose download
+// hashed to sum, as the folders now in addonsDir.
+func newLockEntry(a manifest.Addon, rel source.Release, sum, addonsDir string, folders []string) (lock.Entry, error) {
 	tree, err := install.Digest(addonsDir, folders)
 	if err != nil {
 		return lock.Entry{}, err

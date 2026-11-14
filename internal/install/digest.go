@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 
 	"github.com/maddawik/wam/internal/errs"
 )
@@ -52,7 +51,7 @@ func Digest(addonsDir string, folders []string) (string, error) {
 			return err
 		})
 		if err != nil && !os.IsNotExist(err) {
-			return "", errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot read %s", strings.TrimSpace(root)), "")
+			return "", errs.Wrap(errs.Runtime, err, fmt.Sprintf("cannot read %s", root), "")
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

@@ -124,3 +124,17 @@ func TestListEmptyStateInAllThreeModes(t *testing.T) {
 		t.Errorf("piped: stdout %q", r.Stdout)
 	}
 }
+
+func TestListShowsMissingWhenOneOfSeveralFoldersIsAbsent(t *testing.T) {
+	gh := fakeGitHub(t, map[string][]fakeRelease{"acme/alpha": {{Tag: "v1", Assets: map[string][]byte{
+		"a.zip": makeZip(t, map[string]string{"Alpha/Alpha.toc": "a", "AlphaOptions/AlphaOptions.toc": "o"}),
+	}}}})
+	e := newSyncEnv(t, gh, oneAddon)
+	e.sync(t)
+	if err := os.RemoveAll(filepath.Join(e.addons, "AlphaOptions")); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.cmd(t, "list").Stdout; !strings.Contains(got, "✗ missing") {
+		t.Errorf("stdout = %q", got)
+	}
+}

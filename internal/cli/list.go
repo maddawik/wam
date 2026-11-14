@@ -33,6 +33,26 @@ var statusText = map[string]string{
 	statusModified:  "! modified",
 }
 
+// entryStatus compares what e recorded with what is in addonsDir. A lock
+// written before trees were recorded can't show modification, so it reports
+// installed while its folders are present.
+func entryStatus(addonsDir string, e lock.Entry) (string, error) {
+	if !installed(addonsDir, e.Folders) {
+		return statusMissing, nil
+	}
+	if e.Tree == "" {
+		return statusInstalled, nil
+	}
+	sum, err := install.Digest(addonsDir, e.Folders)
+	if err != nil {
+		return "", err
+	}
+	if sum != e.Tree {
+		return statusModified, nil
+	}
+	return statusInstalled, nil
+}
+
 func newList() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
@@ -40,7 +60,8 @@ func newList() *cobra.Command {
 		Long: "List every addon in the manifest, one per line: name, wanted version,\n" +
 			"locked tag (- if none) and status. Status is ✓ installed, ✗ missing (an\n" +
 			"owned folder is absent) or ! modified (owned folders differ from what\n" +
-			"wam installed). It never uses the network.\n\n" +
+			"wam installed). Addons locked before wam recorded contents can't show\n" +
+			"! modified. It never uses the network.\n\n" +
 			"--json prints an array of objects with the stable fields addon, version,\n" +
 			"locked (empty if none) and status (installed, missing or modified).",
 		Example: "  wam list\n  wam list --json",
@@ -64,17 +85,8 @@ func newList() *cobra.Command {
 				la := listedAddon{Addon: a.Key, Version: a.Version, Status: statusMissing}
 				if e, ok := l.Addons[a.Key]; ok {
 					la.Locked = e.Tag
-					if installed(dir, e.Folders) {
-						la.Status = statusInstalled
-						if e.Tree != "" {
-							sum, err := install.Digest(dir, e.Folders)
-							if err != nil {
-								return err
-							}
-							if sum != e.Tree {
-								la.Status = statusModified
-							}
-						}
+					if la.Status, err = entryStatus(dir, e); err != nil {
+						return err
 					}
 				}
 				out = append(out, la)
