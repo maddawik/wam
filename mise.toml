@@ -25,3 +25,11 @@ run = "mise exec golangci-lint go -- golangci-lint run ./..."
 [tasks.build]
 description = "Build the wam binary"
 run = "go build -o dist/wam ."
+
+[tasks."release:snapshot"]
+description = "Build every release archive and checksums locally into dist/, without publishing"
+run = ["goreleaser check", "goreleaser release --snapshot --clean"]
+
+[tasks.release]
+description = "Tag and push a release, e.g. mise run release v0.1.0"
+run = "go run ./tools/release"

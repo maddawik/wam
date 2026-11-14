@@ -21,3 +21,13 @@ jobs:
       - if: runner.os != 'Windows'
         run: mise run test:race
       - run: mise run build
+
+  # Build every release archive so the GoReleaser config can't rot.
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v5
+      - run: mise run release:snapshot
